@@ -325,6 +325,18 @@ the true foundation and is fully testable in isolation.
   group scroll).
 - Split-ratio drag handles (mouse) and keyboard resize of splits.
 - Accessibility: a screen-reader-friendly serialization of the current frame.
+- **Dynamic-tree reconciliation helper.** A keyed-children utility that diffs a
+  desired `[(TileId, Constraint)]` list into a `Split`/`Carousel`, *preserving the
+  surviving child subtrees* (and thus their focus, scroll offset, and per-tile
+  history) while adding new ids and pruning vanished ones. Every dynamic consumer
+  reinvents this ~20-line function (apptop's Proxmox VM/group reconcile is the
+  motivating case). Keep it in app-land until a second consumer validates the
+  signature, then consider promoting it to core. Depends on stable, identity-
+  derived `TileId`s (hash of durable domain keys, never positional indices).
+- **Engine accessors for dynamic consumers.** Fetch a node by structural `TileId`
+  (`node_mut(id)`) and read a node's id (`tile_id_of(&Node)`). Required by any
+  reconcile step; Phase 3 (focus paths) and Phase 4 (carousel) need them anyway,
+  so add them there rather than treating them as new scope.
 
 ---
 
