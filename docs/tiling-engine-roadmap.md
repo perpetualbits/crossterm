@@ -334,5 +334,9 @@ the true foundation and is fully testable in isolation.
 - **You + Claude (chat)** shape ideas, make the decisions in §8, and write the
   Claude Code prompts — one focused prompt per milestone (or per sub-unit of a
   milestone), each with clear acceptance criteria and the tests it must pass.
+- **Every prompt references `docs/commenting-guidelines.md`** — the project-wide
+  standard for comment blocks per function, inline comments on non-trivial lines,
+  and the mandatory before/after comment-sync discipline. The aim is code readable
+  by both humans and AI, with comments kept rigorously in sync with the code.
 - This document is the living source of truth. Append to §8 and §9 as new
   questions and ideas surface.
