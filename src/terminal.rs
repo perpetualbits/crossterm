@@ -79,8 +79,7 @@ impl<B: Backend> Terminal<B> {
     where
         F: FnOnce(&mut Buffer),
     {
-        // Check for resize; on resize both buffers are already cleared.
-        self.check_resize()?;
+        let resized = self.check_resize()?;
 
         self.back.reset();
         render_fn(&mut self.back);
@@ -88,6 +87,12 @@ impl<B: Backend> Terminal<B> {
         let diff = self.back.diff(&self.front);
 
         self.backend.begin_frame()?;
+        if resized {
+            // The front buffer is now all-spaces (reallocated). Clear the
+            // physical screen so stale content outside the new dimensions is
+            // erased; the diff below will repaint everything non-blank.
+            self.backend.clear()?;
+        }
         self.backend.draw(diff.into_iter())?;
         self.backend.end_frame()?;
 

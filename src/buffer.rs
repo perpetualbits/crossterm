@@ -75,12 +75,22 @@ impl Buffer {
     }
 
     pub fn set(&mut self, x: u16, y: u16, cell: Cell) {
-        // If cell at (x,y) is wide, blank the continuation to the right.
-        // If cell at (x,y) is a continuation, blank the wide cell to the left.
         self.unlink_wide_at(x, y);
 
+        let w = UnicodeWidthStr::width(cell.symbol.as_str());
+        let style = cell.style;
         let i = self.idx(x, y);
         self.cells[i] = cell;
+
+        // Establish the continuation cell so `set` and `set_grapheme` agree.
+        if w == 2 {
+            let rx = x + 1;
+            if rx < self.area.right() {
+                self.unlink_wide_at(rx, y);
+                let j = self.idx(rx, y);
+                self.cells[j] = Cell { symbol: String::new(), style };
+            }
+        }
     }
 
     /// Blank any wide-grapheme partner of the cell at `(x, y)` before overwriting it.
@@ -127,10 +137,11 @@ impl Buffer {
         }
         // Would the grapheme spill past the right edge?
         if x + w > self.area.right() {
-            // Fill with spaces rather than splitting.
-            let space = Cell { symbol: " ".into(), style };
+            // Unlink first: this column may be a continuation of a wide char
+            // to the left; without unlinking, the left half would be stranded.
+            self.unlink_wide_at(x, y);
             let i = self.idx(x, y);
-            self.cells[i] = space;
+            self.cells[i] = Cell { symbol: " ".into(), style };
             return x + 1;
         }
 

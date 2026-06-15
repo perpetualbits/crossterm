@@ -8,6 +8,13 @@ pub use crossterm_backend::CrosstermBackend;
 pub use test_backend::TestBackend;
 
 /// Abstraction over a terminal (or headless surface) that a [`crate::Terminal`] writes to.
+///
+/// # Object safety
+///
+/// `draw` uses `impl Trait` and therefore this trait is **not** object-safe
+/// (`Box<dyn Backend>` is not supported).  `Terminal<B>` is generic over `B`
+/// so this is fine for now.  If runtime backend selection is ever needed,
+/// change `draw` to accept `&mut dyn Iterator<Item = …>` or a `&[(…)]` slice.
 pub trait Backend {
     /// Return the current terminal dimensions.
     fn size(&self) -> io::Result<Rect>;

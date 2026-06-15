@@ -18,6 +18,9 @@ SETUP INSTRUCTIONS
   identity to your chosen PRIMARY identity; you can 'git config user.*' to switch
   for specific commits.
 
+tile-engine MSRV: Rust 1.85 (set by unicode-segmentation 1.13.x; confirmed
+against `cargo metadata` — update if deps change).
+
 Troubleshooting:
 - GitHub 404 on create: token likely fine-grained without repo-creation permission
   (use classic 'repo' scope or enable repo creation).

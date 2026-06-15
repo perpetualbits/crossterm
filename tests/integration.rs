@@ -67,6 +67,7 @@ fn crossterm_backend_style_minimization() {
         .draw(changes.iter().map(|(x, y, c)| (*x, *y, c)))
         .unwrap();
     backend.end_frame().unwrap();
+    drop(backend); // release &mut buf before reading
 
     let output = String::from_utf8_lossy(&buf);
 
@@ -97,6 +98,7 @@ fn crossterm_backend_sync_markers_wrap_frame() {
     backend.begin_frame().unwrap();
     backend.draw(std::iter::empty::<(u16, u16, &Cell)>()).unwrap();
     backend.end_frame().unwrap();
+    drop(backend); // release &mut buf before reading
 
     let output = String::from_utf8_lossy(&buf);
     assert!(output.contains("\x1b[?2026h"), "missing begin-sync marker");
@@ -106,6 +108,26 @@ fn crossterm_backend_sync_markers_wrap_frame() {
     let begin_pos = output.find("\x1b[?2026h").unwrap();
     let end_pos = output.find("\x1b[?2026l").unwrap();
     assert!(begin_pos < end_pos, "begin-sync must precede end-sync");
+}
+
+// ── Resize triggers a physical clear ─────────────────────────────────────────
+
+#[test]
+fn clear_called_on_resize_not_on_steady_frame() {
+    let mut term = make_term(10, 3);
+
+    // First draw: no resize, no clear.
+    term.draw(|buf| { buf.set_string(0, 0, "hello", Style::default()); }).unwrap();
+    assert_eq!(term.backend().clears, 0, "steady frame must not clear");
+
+    // Resize then draw: clear expected.
+    term.backend_mut().resize(8, 3);
+    term.draw(|buf| { buf.set_string(0, 0, "hi", Style::default()); }).unwrap();
+    assert_eq!(term.backend().clears, 1, "resize frame must clear once");
+
+    // Another steady draw: no additional clear.
+    term.draw(|buf| { buf.set_string(0, 0, "bye", Style::default()); }).unwrap();
+    assert_eq!(term.backend().clears, 1, "second steady frame must not clear again");
 }
 
 // ── Resize robustness ─────────────────────────────────────────────────────────

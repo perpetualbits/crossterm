@@ -2,7 +2,7 @@
 name = "tile-engine"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.85"
 description = "A general-purpose terminal UI tiling engine"
 license = "MIT"
 
@@ -21,3 +21,4 @@ unicode-segmentation = "1"
 unicode-width = "0.2"
 
 [dev-dependencies]
+unicode-width = "0.2"

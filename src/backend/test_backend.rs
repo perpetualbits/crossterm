@@ -9,14 +9,17 @@ use crate::{
 /// A headless [`Backend`] that accumulates draw calls into an in-memory buffer.
 ///
 /// Useful for snapshot tests: build a frame with [`crate::Terminal`], then call
-/// [`TestBackend::to_string`] to get a plain-text grid for golden assertions.
+/// [`TestBackend::render`] to get a plain-text grid for golden assertions.
 pub struct TestBackend {
     buffer: Buffer,
+    /// Number of times [`clear`](Backend::clear) has been called.
+    /// Useful for asserting that a resize triggers exactly one physical clear.
+    pub clears: usize,
 }
 
 impl TestBackend {
     pub fn new(width: u16, height: u16) -> Self {
-        Self { buffer: Buffer::empty(Rect::new(0, 0, width, height)) }
+        Self { buffer: Buffer::empty(Rect::new(0, 0, width, height)), clears: 0 }
     }
 
     /// Read access to the current buffer state.
@@ -76,6 +79,7 @@ impl Backend for TestBackend {
     }
 
     fn clear(&mut self) -> io::Result<()> {
+        self.clears += 1;
         self.buffer.reset();
         Ok(())
     }
