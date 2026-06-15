@@ -44,6 +44,7 @@
 pub mod backend;
 pub mod buffer;
 pub mod geometry;
+pub mod layout;
 pub mod style;
 pub mod terminal;
 
