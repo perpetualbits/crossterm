@@ -4,11 +4,11 @@
 > mullion resolves it into one rectangle per tile; you paint into those
 > rectangles. A double-buffered `Terminal` diffs and flushes only what changed.
 >
-> **Status:** Phases 0–7b complete — rendering substrate, layout solver, borders +
+> **Status:** Phases 0–7 complete — rendering substrate, layout solver, borders +
 > junctions, focus, input, smooth virtualized carousels, zoom, border labels,
-> mouse, and directional (arrow) navigation. Theming + degraded-terminal fallback
-> (7c/7d) and apptop integration / the `TileContent` trait (8) are still ahead and
-> are flagged **(upcoming)** below.
+> mouse, directional navigation, theming, color downsampling, and degraded-terminal
+> fallback. Apptop integration / the `TileContent` trait (Phase 8) is still ahead
+> and is flagged **(upcoming)** below.
 
 ---
 
@@ -85,8 +85,9 @@ clears the back buffer, runs your closure, diffs against the front buffer, and
 flushes only the changed cells inside synchronized-output markers. Backends:
 `CrosstermBackend` (real terminal) and `TestBackend` (headless).
 
-A complete, runnable program lives in `examples/showcase.rs` — it exercises the
-smooth carousel, labels, focus, zoom, and animation together (see §5).
+The snippet above compiles and runs as `examples/quickstart.rs` — see §5.
+A fully featured program lives in `examples/showcase.rs` — it exercises the
+smooth carousel, labels, focus, zoom, and animation together.
 
 ---
 
@@ -293,12 +294,55 @@ for apps that compose regions. The backend enables mouse capture on `enter` and
 restores it on `leave`/panic (opt out via `set_mouse_capture(false)`). Treating a
 click as *enter* is the app's call (it can `zoom_to` after seeing `Focused`).
 
-### 3.10 Theming & degraded terminals **(upcoming — Phase 7c/7d)**
+### 3.10 Theming & degraded terminals
 
-A `Theme` of named style roles (border, focused border, text, dim, accent,
-selection), color **downsampling** (truecolor → 256 → 16) applied at the backend,
-an **ASCII** box-drawing fallback for terminals without reliable Unicode, and
-capability detection to select depth + charset automatically.
+#### Theme
+
+`Theme` groups six named `Style` roles so the whole interface can be recolored by
+swapping one value:
+
+| Role | Purpose |
+|------|---------|
+| `border` | Unfocused tile borders |
+| `border_focused` | Focused tile border |
+| `text` | Primary content text |
+| `text_dim` | Secondary text (labels, hints) |
+| `accent` | Gauges, marquees, selected controls |
+| `selection` | Selected-item highlight background |
+
+Two built-in palettes: `Theme::default()` (dark, cyan accent) and `Theme::light()`
+(black text, blue accent).  `theme.border_style(focused)` returns a ready-to-use
+`BorderStyle` with `Heavy` weight for the focused tile, `Light` for others.
+
+#### Color downsampling
+
+`Color::downsample(depth: ColorDepth)` maps an `Rgb` colour to the nearest
+palette entry.  `ColorDepth` variants:
+
+| Variant | Behaviour |
+|---------|-----------|
+| `TrueColor` | Identity (default) |
+| `Palette256` | Nearest xterm-256 cube or 24-step grayscale ramp |
+| `Palette16` | Nearest ANSI 16 named colour |
+
+`CrosstermBackend::set_color_depth` applies downsampling to every cell before
+emission.
+
+#### Capability detection and ASCII fallback
+
+`Capabilities::detect()` reads `COLORTERM`, `TERM`, and the locale to infer what
+the terminal supports, then `apply_capabilities` wires everything at once:
+
+```rust
+use mullion::{backend::CrosstermBackend, capabilities::Capabilities};
+let mut backend = CrosstermBackend::new(std::io::stdout());
+backend.apply_capabilities(&Capabilities::detect());
+```
+
+When `Capabilities::unicode` is `false` (e.g. `TERM=linux`), the backend
+replaces every box-drawing glyph with `box_to_ascii` before emission:
+horizontals → `'-'`, verticals → `'|'`, corners/tees/crosses → `'+'`.
+Content text passes through unchanged.
 
 ---
 
@@ -307,9 +351,12 @@ capability detection to select depth + charset automatically.
 | Module | Key items |
 |--------|-----------|
 | `geometry` | `Rect` (`intersection`, `contains`, `right`, `bottom`, `area`) |
-| `style` | `Style`, `Color`, `Modifier` |
+| `style` | `Style`, `Color`, `ColorDepth`, `Modifier` |
+| `theme` | `Theme` (`default`, `light`, `border_style`) |
+| `capabilities` | `Capabilities` (`detect`, `full`, `from_env`) |
+| `charset` | `box_to_ascii` |
 | `buffer` | `Buffer` (`set_string`, `set_grapheme`, `blit`), `Cell` |
-| `backend` | `Backend`, `CrosstermBackend`, `TestBackend` |
+| `backend` | `Backend`, `CrosstermBackend` (`apply_capabilities`, `set_color_depth`, `set_unicode`), `TestBackend` |
 | `terminal` | `Terminal` |
 | `layout` | `solve`, `Node`, `Constraint`, `Size`, `Orientation`, `Axis` |
 | `tree` | `Tree`, `Dir`, `Direction`, `tile_id_of`, `leaves`, `focus_path`, `focus_override`, `node_by_id`/`node_by_id_mut` |
@@ -327,25 +374,51 @@ capability detection to select depth + charset automatically.
 `is_zoomed`/`zoom_depth`/`ensure_zoom_valid`, `effective_root`/`effective_root_mut`.
 
 Common re-exports at the crate root: `Buffer`, `Cell`, `Node`, `Constraint`,
-`Size`, `Orientation`, `LineWeight`. Module-scoped: `Axis` (`layout`),
+`Size`, `Orientation`, `LineWeight`, `Theme`, `Capabilities`, `box_to_ascii`,
+`Color`, `ColorDepth`, `Style`.  Module-scoped: `Axis` (`layout`),
 `Dir`/`Direction` (`tree`).
 
 ---
 
-## 5. A worked example
+## 5. Examples
 
-`examples/showcase.rs` is a runnable monitor: a `render_shared` header strip, a
-vertical smooth-scrolling `Carousel` of node tiles rendered with `render_carousel`,
-each tile carrying a marquee top-border label and an upright units label, with
-arrow-key focus, a Heavy-border focus highlight, Enter/Esc zoom, virtualization,
-and render-tick animation. Run it with `cargo run --example showcase`. It is also
-the reference for the `render_carousel` ↔ `render_shared` composition.
+**`examples/quickstart.rs`** — the compilable version of the §2 getting-started
+snippet.  Uses `Buffer::empty` and an in-memory render (no real terminal needed):
+
+```text
+cargo run --example quickstart
+```
+
+**`examples/showcase.rs`** — a full runnable monitor: `render_shared` header strip,
+vertical smooth-scrolling `Carousel` with `render_carousel`, marquee top-border
+labels, upright units labels, arrow-key focus, Heavy-border focus highlight,
+Enter/Esc zoom, virtualization, and render-tick animation:
+
+```text
+cargo run --example showcase
+```
+
+`showcase.rs` is the reference for the `render_carousel` ↔ `render_shared` composition.
 
 ---
 
 ## 6. Status & roadmap
 
-Complete and reviewed: Phases 0–7b. Upcoming: 7c (theming + color downsampling),
-7d (ASCII fallback + capability detection), 8 (apptop integration + the
-`TileContent` trait). See `docs/tiling-engine-roadmap.md` for the full plan and
-open design questions. This manual tracks the public API as each phase merges.
+**Complete (Phases 0–7):**
+
+| Phase | What landed |
+|-------|-------------|
+| 0–2   | Buffer, Terminal, Backend, layout solver, per-tile and shared borders, junction resolver |
+| 3     | Focus model, `Tree`, DFS traversal, zoom |
+| 4     | Input routing, `InputRouter`, `Keymap` |
+| 5     | Smooth virtualized `Carousel`, `render_carousel`, `blit` |
+| 6     | Border labels, marquee scrolling, upright vertical text |
+| 7a    | Mouse: hit-test, click-focus, wheel scroll, hover-focus |
+| 7b    | Directional focus (`focus_dir`, `focus_dir_cross`), arrow keymap, `Keymap::vim_prefix` |
+| 7c    | `Theme` (named style roles), `ColorDepth`, `Color::downsample` |
+| 7d    | `Capabilities::detect`, `box_to_ascii`, `apply_capabilities`, quickstart example |
+
+**Upcoming:** Phase 8 — apptop integration, `TileContent` trait.
+
+See `docs/tiling-engine-roadmap.md` for the full plan and open design questions.
+This manual tracks the public API as each phase merges.

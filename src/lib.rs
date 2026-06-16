@@ -46,6 +46,8 @@
 pub mod backend;
 pub mod border;
 pub mod buffer;
+pub mod capabilities;
+pub mod charset;
 pub mod geometry;
 pub mod input;
 pub mod junction;
@@ -66,6 +68,8 @@ pub use geometry::Rect;
 pub use input::{InputRouter, Keymap, KeyCode, KeyEvent, KeyModifiers, KeyOutcome, MouseButton, MouseEvent, MouseEventKind, MouseOutcome, NavCommand};
 pub use mouse::{carousel_at, tile_at};
 pub use layout::{Constraint, Node, Orientation, Size, TileId};
+pub use capabilities::Capabilities;
+pub use charset::box_to_ascii;
 pub use style::{Color, ColorDepth, Modifier, Style};
 pub use theme::Theme;
 pub use terminal::{poll_event, read_event, Terminal};

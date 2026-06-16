@@ -19,6 +19,8 @@ use crossterm::{
 use crate::{
     backend::Backend,
     buffer::Cell,
+    capabilities::Capabilities,
+    charset::box_to_ascii,
     geometry::Rect,
     style::{Color, ColorDepth, Modifier, Style},
 };
@@ -57,6 +59,13 @@ const END_SYNC: &[u8] = b"\x1b[?2026l";
 /// sequence it emitted in `last_style`.  A new SGR run is only queued when the
 /// style for the next cell differs from the previously emitted style, reducing
 /// the number of escape sequences sent per frame.
+///
+/// ## Capability adaptation
+///
+/// Call [`apply_capabilities`](CrosstermBackend::apply_capabilities) with a
+/// [`Capabilities`] value (from [`Capabilities::detect`](crate::capabilities::Capabilities::detect))
+/// to configure all adaptations at once.  Individual setters are also available:
+/// [`CrosstermBackend::set_color_depth`], [`CrosstermBackend::set_unicode`], [`CrosstermBackend::set_mouse_capture`].
 pub struct CrosstermBackend<W: Write> {
     /// The underlying byte sink (usually `io::Stdout` or a `Vec<u8>` in tests).
     writer: W,
@@ -72,8 +81,14 @@ pub struct CrosstermBackend<W: Write> {
     mouse_enabled: bool,
     /// Colour depth used to downsample [`Color::Rgb`] and [`Color::Indexed`] before
     /// emitting SGR sequences.  Default: [`ColorDepth::TrueColor`] (identity).
-    /// Set via [`set_color_depth`](CrosstermBackend::set_color_depth).
     color_depth: ColorDepth,
+    /// When `false`, box-drawing glyphs in cell symbols are mapped to ASCII
+    /// via [`box_to_ascii`] before emission.  Default: `true`.
+    unicode: bool,
+    /// When `false`, the `\x1b[?2026h/l` synchronized-output markers are not
+    /// emitted in [`begin_frame`](Backend::begin_frame) /
+    /// [`end_frame`](Backend::end_frame).  Default: `true`.
+    synchronized_output: bool,
 }
 
 impl<W: Write> CrosstermBackend<W> {
@@ -84,10 +99,12 @@ impl<W: Write> CrosstermBackend<W> {
     pub fn new(writer: W) -> Self {
         Self {
             writer,
-            last_style:  None,
-            entered:     false,
-            mouse_enabled: true,
-            color_depth: ColorDepth::default(),
+            last_style:         None,
+            entered:            false,
+            mouse_enabled:      true,
+            color_depth:        ColorDepth::default(),
+            unicode:            true,
+            synchronized_output: true,
         }
     }
 
@@ -109,6 +126,30 @@ impl<W: Write> CrosstermBackend<W> {
     /// Call this before the first draw call for consistent results.
     pub fn set_color_depth(&mut self, depth: ColorDepth) {
         self.color_depth = depth;
+    }
+
+    /// Enable or disable Unicode box-drawing output.
+    ///
+    /// When `on` is `false`, each cell's symbol is passed through
+    /// [`box_to_ascii`] before emission: box-drawing glyphs become `-`, `|`,
+    /// or `+`, while other characters pass through unchanged.  Use this on
+    /// terminals that do not render Unicode box-drawing reliably (e.g. the
+    /// Linux text console).  Default: `true` (box-drawing emitted as-is).
+    pub fn set_unicode(&mut self, on: bool) {
+        self.unicode = on;
+    }
+
+    /// Apply a [`Capabilities`] value detected from the environment.
+    ///
+    /// Sets [`color_depth`](CrosstermBackend::set_color_depth),
+    /// [`unicode`](CrosstermBackend::set_unicode), and the
+    /// synchronized-output flag in one call.  Convenience wrapper for the
+    /// [`Capabilities::detect`](crate::capabilities::Capabilities::detect) →
+    /// backend setup pattern.
+    pub fn apply_capabilities(&mut self, caps: &Capabilities) {
+        self.color_depth        = caps.color;
+        self.unicode            = caps.unicode;
+        self.synchronized_output = caps.synchronized_output;
     }
 
     /// Write the escape sequences that restore the terminal to its normal state.
@@ -241,7 +282,8 @@ impl<W: Write> Backend for CrosstermBackend<W> {
         &mut self,
         changes: impl Iterator<Item = (u16, u16, &'a Cell)>,
     ) -> io::Result<()> {
-        let depth = self.color_depth;
+        let depth   = self.color_depth;
+        let unicode = self.unicode;
         for (x, y, cell) in changes {
             queue!(self.writer, MoveTo(x, y))?;
             // Downsample the cell's fg/bg before comparing and emitting so that
@@ -256,26 +298,38 @@ impl<W: Write> Backend for CrosstermBackend<W> {
                 emit_style(&mut self.writer, style)?;
                 self.last_style = Some(style);
             }
-            queue!(self.writer, Print(&cell.symbol))?;
+            if unicode {
+                queue!(self.writer, Print(&cell.symbol))?;
+            } else {
+                // Map box-drawing glyphs to ASCII; content chars are unchanged.
+                let mapped: String = cell.symbol.chars().map(box_to_ascii).collect();
+                queue!(self.writer, Print(mapped))?;
+            }
         }
         Ok(())
     }
 
-    /// Emit the synchronized-output begin marker.
+    /// Emit the synchronized-output begin marker (if enabled).
     ///
     /// The `?2026h` DEC private mode tells supporting terminals to buffer their
     /// rendering until the matching end marker, preventing partial-frame tearing.
+    /// Skipped when `synchronized_output` is `false` (set via
+    /// [`apply_capabilities`](CrosstermBackend::apply_capabilities)).
     fn begin_frame(&mut self) -> io::Result<()> {
-        self.writer.write_all(BEGIN_SYNC)?;
+        if self.synchronized_output {
+            self.writer.write_all(BEGIN_SYNC)?;
+        }
         Ok(())
     }
 
-    /// Emit the synchronized-output end marker and flush the writer.
+    /// Emit the synchronized-output end marker (if enabled) and flush the writer.
     ///
     /// Must be called after all [`draw`](Backend::draw) calls for the current
     /// frame.  The flush ensures the frame reaches the terminal promptly.
     fn end_frame(&mut self) -> io::Result<()> {
-        self.writer.write_all(END_SYNC)?;
+        if self.synchronized_output {
+            self.writer.write_all(END_SYNC)?;
+        }
         self.flush()
     }
 
@@ -436,6 +490,88 @@ mod tests {
         let out = String::from_utf8_lossy(&buf);
         assert!(!out.contains("38;2;"), "Palette16 must not emit truecolor fg: {out:?}");
         assert!(!out.contains("48;2;"), "Palette16 must not emit truecolor bg: {out:?}");
+    }
+
+    #[test]
+    fn unicode_true_emits_box_char_unchanged() {
+        use crate::buffer::Cell;
+        use crate::style::{Modifier, Style};
+        let mut buf = Vec::<u8>::new();
+        {
+            let mut backend = CrosstermBackend::new(&mut buf);
+            // unicode=true is the default.
+            let cell = Cell {
+                symbol: "─".into(),
+                style:  Style { fg: Color::Reset, bg: Color::Reset, mods: Modifier::empty() },
+            };
+            backend.draw(std::iter::once((0u16, 0u16, &cell))).unwrap();
+        }
+        let out = String::from_utf8_lossy(&buf);
+        assert!(out.contains('─'), "unicode=true must emit '─' as-is: {out:?}");
+    }
+
+    #[test]
+    fn unicode_false_maps_horizontal_box_char_to_dash() {
+        use crate::buffer::Cell;
+        use crate::style::{Modifier, Style};
+        let mut buf = Vec::<u8>::new();
+        {
+            let mut backend = CrosstermBackend::new(&mut buf);
+            backend.set_unicode(false);
+            let cell = Cell {
+                symbol: "─".into(),
+                style:  Style { fg: Color::Reset, bg: Color::Reset, mods: Modifier::empty() },
+            };
+            backend.draw(std::iter::once((0u16, 0u16, &cell))).unwrap();
+        }
+        let out = String::from_utf8_lossy(&buf);
+        assert!(!out.contains('─'), "unicode=false must replace '─': {out:?}");
+        assert!(out.contains('-'), "unicode=false must emit '-' for '─': {out:?}");
+    }
+
+    #[test]
+    fn unicode_false_maps_corner_to_plus() {
+        use crate::buffer::Cell;
+        use crate::style::{Modifier, Style};
+        let mut buf = Vec::<u8>::new();
+        {
+            let mut backend = CrosstermBackend::new(&mut buf);
+            backend.set_unicode(false);
+            let cell = Cell {
+                symbol: "┌".into(),
+                style:  Style { fg: Color::Reset, bg: Color::Reset, mods: Modifier::empty() },
+            };
+            backend.draw(std::iter::once((0u16, 0u16, &cell))).unwrap();
+        }
+        let out = String::from_utf8_lossy(&buf);
+        assert!(out.contains('+'), "unicode=false must emit '+' for '┌': {out:?}");
+    }
+
+    #[test]
+    fn apply_capabilities_combines_color_and_unicode() {
+        use crate::buffer::Cell;
+        use crate::capabilities::Capabilities;
+        use crate::style::{Modifier, Style};
+        let mut buf = Vec::<u8>::new();
+        {
+            let mut backend = CrosstermBackend::new(&mut buf);
+            backend.apply_capabilities(&Capabilities {
+                color: ColorDepth::Palette16,
+                unicode: false,
+                synchronized_output: true,
+            });
+            let cell = Cell {
+                symbol: "─".into(),
+                style:  Style { fg: Color::Rgb(255, 0, 0), bg: Color::Reset, mods: Modifier::empty() },
+            };
+            backend.draw(std::iter::once((0u16, 0u16, &cell))).unwrap();
+        }
+        let out = String::from_utf8_lossy(&buf);
+        // Palette16: no truecolor sequence.
+        assert!(!out.contains("38;2;"), "Palette16 must not emit truecolor fg: {out:?}");
+        // unicode=false: box char replaced.
+        assert!(!out.contains('─'), "unicode=false must replace '─': {out:?}");
+        assert!(out.contains('-'), "unicode=false must emit '-': {out:?}");
     }
 
     #[test]
