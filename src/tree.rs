@@ -15,7 +15,8 @@
 //! structural edits (`flip`, `swap`).
 
 use crate::border::LineWeight;
-use crate::layout::{Axis, Node, Orientation, TileId};
+use crate::geometry::Rect;
+use crate::layout::{Axis, Node, Orientation, TileId, partition};
 
 // ── Free functions ────────────────────────────────────────────────────────────
 
@@ -197,6 +198,114 @@ fn node_at_path_mut<'a>(root: &'a mut Node, path: &[usize]) -> Option<&'a mut No
         }
     }
     Some(cur)
+}
+
+/// Walk `root` → leaf along `path`, adjusting `Carousel::scroll` at each
+/// carousel level so the focused child is flush-visible within its viewport.
+///
+/// `rect` is the on-screen area that `node` occupies at this level, passed
+/// down through splits and carousels the same way `solve_into` does, so that
+/// nested carousels each receive the correct viewport size.
+///
+/// For `Split` nodes the axis is resolved (updating `Adaptive::last`) and
+/// the child's rect is computed via [`partition`] — the same geometry as
+/// `solve_into` but without border insets.  For `Carousel` nodes the scroll
+/// is nudged the minimum amount to make the focused child flush-visible, then
+/// the child's on-screen clipped rect is derived from the new scroll and
+/// passed into the recursion.
+fn reveal_focus_path(node: &mut Node, path: &[usize], rect: Rect) {
+    if path.is_empty() {
+        return;
+    }
+    let child_idx = path[0];
+    let rest = &path[1..];
+    match node {
+        Node::Tile(_) => {}
+        Node::Split { orientation, children } => {
+            if child_idx >= children.len() { return; }
+            let axis = orientation.resolve(rect);
+            let total = match axis {
+                Axis::Horizontal => rect.width,
+                Axis::Vertical => rect.height,
+            };
+            let sizes = partition(children, total);
+            // Advance to the focused child's main-axis origin.
+            let mut pos = match axis {
+                Axis::Horizontal => rect.x,
+                Axis::Vertical => rect.y,
+            };
+            for i in 0..child_idx {
+                pos = pos.saturating_add(sizes[i]);
+            }
+            let size = sizes[child_idx];
+            let child_rect = match axis {
+                Axis::Horizontal => Rect::new(pos, rect.y, size, rect.height),
+                Axis::Vertical   => Rect::new(rect.x, pos, rect.width, size),
+            };
+            reveal_focus_path(&mut children[child_idx].1, rest, child_rect);
+        }
+        Node::Carousel { orientation, scroll, children, .. } => {
+            if child_idx >= children.len() { return; }
+            let axis = orientation.resolve(rect);
+            let (main_extent, cross_extent) = match axis {
+                Axis::Horizontal => (rect.width, rect.height),
+                Axis::Vertical   => (rect.height, rect.width),
+            };
+            let vp_main_origin = match axis {
+                Axis::Horizontal => rect.x,
+                Axis::Vertical   => rect.y,
+            };
+
+            let child_start: u32 = children[..child_idx].iter().map(|(e, _)| *e as u32).sum();
+            let ext = children[child_idx].0;
+            let total: u32 = children.iter().map(|(e, _)| *e as u32).sum();
+            let max_scroll = total.saturating_sub(main_extent as u32).min(u16::MAX as u32) as u16;
+
+            // `rest` being empty means this carousel is the direct container of
+            // the focused leaf.  The "too-tall tile reveals its top" rule only
+            // applies at that level (a too-tall *container* child should instead
+            // use the far-edge reveal so the descent into it reaches the right
+            // inner position).
+            let is_leaf_child = rest.is_empty();
+            let is_too_tall   = (ext as u32) > (main_extent as u32);
+
+            // Three cases checked in priority order:
+            //
+            //  1. Child's top is above the viewport → reveal near edge (always).
+            //  2. Focused leaf is too-tall (doesn't fit) and its top is not yet
+            //     at the viewport top → align its top.  Any other scroll would
+            //     either show less of the tile or cut off its top.
+            //  3. Anything else with its far edge past the viewport → reveal far
+            //     edge.  Covers: normal leaf below viewport, container child of
+            //     any size below viewport (including too-tall containers whose
+            //     inner focused tile may be near the bottom of the container).
+            let mut new = *scroll as u32;
+            if child_start < new {
+                new = child_start;                                    // case 1: pull up
+            } else if is_leaf_child && is_too_tall && child_start > new {
+                new = child_start;                                    // case 2: align top
+            } else if !is_too_tall || !is_leaf_child {
+                if child_start + ext as u32 > new + main_extent as u32 {
+                    new = child_start + ext as u32 - main_extent as u32; // case 3: reveal far edge
+                }
+            }
+            let new_scroll = (new.min(u16::MAX as u32) as u16).min(max_scroll);
+            *scroll = new_scroll;
+
+            // Derive the focused child's on-screen clipped rect after adjustment.
+            let vis_start = child_start.max(new_scroll as u32);
+            let vis_end = (child_start + ext as u32).min(new_scroll as u32 + main_extent as u32);
+            if vis_start >= vis_end { return; }
+            let vis_len = (vis_end - vis_start) as u16;
+            let screen_start = vp_main_origin + (vis_start - new_scroll as u32) as u16;
+
+            let child_rect = match axis {
+                Axis::Horizontal => Rect::new(screen_start, rect.y, vis_len, cross_extent),
+                Axis::Vertical   => Rect::new(rect.x, screen_start, cross_extent, vis_len),
+            };
+            reveal_focus_path(&mut children[child_idx].1, rest, child_rect);
+        }
+    }
 }
 
 // ── Tree ──────────────────────────────────────────────────────────────────────
@@ -393,6 +502,42 @@ impl Tree {
             *scroll = offset;
         }
     }
+
+    /// Adjust the scroll of every `Carousel` on the path to the focused leaf
+    /// so the focused tile is fully within each carousel's viewport.
+    ///
+    /// Reveals the minimum needed: flush to the near edge when the tile is
+    /// before the window, flush to the far edge when after, untouched when
+    /// already wholly visible.  A tile taller than the viewport has its **top**
+    /// edge revealed (scroll = child_start) rather than its bottom, to avoid
+    /// thrashing.  Nested carousels are adjusted outer-first so each inner
+    /// carousel receives the correct viewport rect.
+    ///
+    /// No-op when there is no focus or when no carousel sits on the focus path.
+    ///
+    /// ## Geometry assumption
+    ///
+    /// Carousel viewports are computed with `solve`-style layout (no border
+    /// inset).  If the layout skeleton is rendered with
+    /// [`render_shared`](crate::border::render_shared) (which deflates by one
+    /// cell for shared borders), the revealed position may be off by ~1 cell at
+    /// carousel boundaries — an acceptable slack for most use cases.  Pass the
+    /// un-inset `area` (same rect as `solve`) to avoid this discrepancy.
+    ///
+    /// ## Call site
+    ///
+    /// Call once per frame after a focus change and before rendering, passing
+    /// the same `area` that will be passed to `solve` / `render_carousel`.
+    /// [`InputRouter`](crate::input::InputRouter) does **not** call this — it
+    /// has no viewport.
+    pub fn scroll_focus_into_view(&mut self, area: Rect) {
+        let focus_id = match self.focus { Some(id) => id, None => return };
+        let path = match focus_path(&self.root, focus_id) {
+            Some(p) => p,
+            None => return,
+        };
+        reveal_focus_path(&mut self.root, &path, area);
+    }
 }
 
 /// Build the `overrides` slice for [`render_shared`](crate::border::render_shared)
@@ -411,6 +556,7 @@ pub fn focus_override(tree: &Tree, w: LineWeight) -> Vec<(TileId, LineWeight)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::Rect;
     use crate::layout::{Constraint, Orientation, Size};
 
     fn tile(id: TileId) -> Node {
@@ -991,6 +1137,222 @@ mod tests {
         tree.scroll_to(999, 0); // id 999 does not exist → no-op
         if let Some(Node::Carousel { scroll, .. }) = node_by_id(tree.root(), 1) {
             assert_eq!(*scroll, 10, "scroll must be unchanged");
+        }
+    }
+
+    // ── scroll_focus_into_view ────────────────────────────────────────────
+
+    /// Return the current scroll of the carousel identified by `car_id`.
+    fn get_scroll(tree: &Tree, car_id: TileId) -> u16 {
+        if let Some(Node::Carousel { scroll, .. }) = node_by_id(tree.root(), car_id) {
+            *scroll
+        } else {
+            panic!("carousel {car_id} not found in tree")
+        }
+    }
+
+    /// Vertical carousel (car_id) with 5 children × 5 rows each, focused on
+    /// `focus_id`.  `scroll` is the initial offset.
+    fn vert_carousel_tree5(car_id: TileId, scroll: u16, focus_id: TileId) -> Tree {
+        let root = Node::Carousel {
+            id: car_id,
+            orientation: Orientation::Vertical,
+            scroll,
+            children: (0u64..5).map(|i| (5u16, Node::Tile(i))).collect(),
+        };
+        let mut tree = Tree::new(root);
+        tree.focus_set(focus_id);
+        tree
+    }
+
+    #[test]
+    fn reveal_tile_below_fold_flush_at_far_edge() {
+        // 5 children × 5 rows = 25 total; viewport height = 10.
+        // Focus tile 4: child_start=20, ext=5. scroll=0 → [0,10); tile below fold.
+        // Bottom check: 20+5=25 > 0+10 → new = 25-10 = 15.
+        let area = Rect::new(0, 0, 10, 10);
+        let mut tree = vert_carousel_tree5(100, 0, 4);
+        tree.scroll_focus_into_view(area);
+        assert_eq!(get_scroll(&tree, 100), 15,
+            "scroll must be 15 so tile 4 is flush at the bottom edge");
+    }
+
+    #[test]
+    fn reveal_tile_above_fold_flush_at_near_edge() {
+        // scroll=10 → viewport [10,20); tile 0 at [0,5) is above the fold.
+        // Top check: child_start=0 < scroll=10 → new = 0.
+        let area = Rect::new(0, 0, 10, 10);
+        let mut tree = vert_carousel_tree5(100, 10, 0);
+        tree.scroll_focus_into_view(area);
+        assert_eq!(get_scroll(&tree, 100), 0,
+            "scroll must be 0 so tile 0 is flush at the top edge");
+    }
+
+    #[test]
+    fn reveal_already_visible_tile_unchanged() {
+        // scroll=0 → viewport [0,10); tile 1 at [5,10) is fully visible → no change.
+        let area = Rect::new(0, 0, 10, 10);
+        let mut tree = vert_carousel_tree5(100, 0, 1);
+        tree.scroll_focus_into_view(area);
+        assert_eq!(get_scroll(&tree, 100), 0, "scroll must be unchanged");
+    }
+
+    #[test]
+    fn reveal_taller_than_viewport_reveals_top_edge() {
+        // Carousel: [Tile(0) extent=15, Tile(1) extent=5]; viewport height=10.
+        // Focus tile 0: child_start=0, ext=15 > main_extent=10. scroll=5.
+        // Top check: 0 < 5 → new = 0 (reveals top, not bottom).
+        let root = Node::Carousel {
+            id: 100,
+            orientation: Orientation::Vertical,
+            scroll: 5,
+            children: vec![
+                (15u16, Node::Tile(0)),
+                (5u16, Node::Tile(1)),
+            ],
+        };
+        let mut tree = Tree::new(root);
+        tree.focus_set(0);
+        let area = Rect::new(0, 0, 10, 10);
+        tree.scroll_focus_into_view(area);
+        assert_eq!(get_scroll(&tree, 100), 0,
+            "too-tall child: scroll must reveal the top edge, not thrash to bottom");
+    }
+
+    #[test]
+    fn reveal_nested_carousels_both_scroll() {
+        // Outer vertical carousel (id=10): 3 children × 20 rows; viewport height=10.
+        // Outer child 2 = inner horizontal carousel (id=20): 3 children × 5 cols; viewport width=8.
+        // Focus inner tile 2 (child_idx=2 in inner).
+        //
+        // Outer: child_start=40, ext=20, scroll=0, main_extent=10.
+        //   Bottom check: 40+20=60 > 0+10 → new = 60-10 = 50.
+        //   max_scroll = 60-10 = 50.  outer scroll → 50.
+        //   on-screen rect for outer child 2 = Rect::new(0, 0, 8, 10).
+        //
+        // Inner: child_start=10, ext=5, scroll=0, main_extent=8.
+        //   Bottom check: 10+5=15 > 0+8 → new = 15-8 = 7.
+        //   max_scroll = 15-8 = 7.  inner scroll → 7.
+        let inner = Node::Carousel {
+            id: 20,
+            orientation: Orientation::Horizontal,
+            scroll: 0,
+            children: vec![
+                (5u16, Node::Tile(0)),
+                (5u16, Node::Tile(1)),
+                (5u16, Node::Tile(2)),
+            ],
+        };
+        let root = Node::Carousel {
+            id: 10,
+            orientation: Orientation::Vertical,
+            scroll: 0,
+            children: vec![
+                (20u16, Node::Tile(10)),
+                (20u16, Node::Tile(11)),
+                (20u16, inner),
+            ],
+        };
+        let area = Rect::new(0, 0, 8, 10);
+        let mut tree = Tree::new(root);
+        tree.focus_set(2); // inner tile 2
+        tree.scroll_focus_into_view(area);
+        assert_eq!(get_scroll(&tree, 10), 50,
+            "outer carousel must scroll to expose inner carousel (child 2)");
+        assert_eq!(get_scroll(&tree, 20), 7,
+            "inner carousel must scroll to expose tile 2");
+    }
+
+    #[test]
+    fn reveal_no_focus_is_noop() {
+        let mut tree = Tree::new(h_split(vec![])); // no leaves → focus = None
+        tree.scroll_focus_into_view(Rect::new(0, 0, 80, 24)); // must not panic
+    }
+
+    #[test]
+    fn reveal_no_carousel_on_path_is_noop() {
+        // Pure h_split tree — no carousel → no state to change, no panic.
+        let mut tree = Tree::new(h_split(vec![tile(0), tile(1)]));
+        tree.focus_set(0);
+        tree.scroll_focus_into_view(Rect::new(0, 0, 80, 24));
+        assert_eq!(tree.focus(), Some(0));
+    }
+
+    #[test]
+    fn reveal_integration_focused_child_fully_framed() {
+        // After scroll_focus_into_view the carousel is in the right position so
+        // render_carousel shows the focused child with both borders intact.
+        //
+        // 3 children × 5 rows; viewport 10×5. Focus tile 2 (child_start=10, ext=5).
+        // scroll=0 → bottom check: 10+5=15 > 0+5 → new = 15-5 = 10.
+        // render at scroll=10: child 2 fills the entire viewport → full box visible.
+        use crate::{
+            border::{draw_box, BorderStyle, Borders, CornerStyle, LineWeight},
+            buffer::Buffer,
+            render::render_carousel,
+            style::Style,
+        };
+        let root = Node::Carousel {
+            id: 1,
+            orientation: Orientation::Vertical,
+            scroll: 0,
+            children: (0u64..3).map(|i| (5u16, Node::Tile(i))).collect(),
+        };
+        let area = Rect::new(0, 0, 10, 5);
+        let mut tree = Tree::new(root);
+        tree.focus_set(2);
+        tree.scroll_focus_into_view(area);
+        assert_eq!(get_scroll(&tree, 1), 10, "pre-condition: scroll must be 10");
+
+        let bstyle = BorderStyle {
+            weight: LineWeight::Light,
+            corners: CornerStyle::Square,
+            style: Style::default(),
+        };
+        let mut buf = Buffer::empty(area);
+        render_carousel(&mut buf, tree.root_mut(), area, &mut |b, _id, rect| {
+            draw_box(b, rect, Borders::ALL, &bstyle);
+        });
+        assert_eq!(buf.get(0, 0).symbol, "┌", "top border of focused child must be present");
+        assert_eq!(buf.get(0, 4).symbol, "└", "bottom border of focused child must be present");
+    }
+
+    proptest! {
+        /// After `scroll_focus_into_view`, the focused child's `[start, start+ext)`
+        /// is contained in `[scroll, scroll+main_extent)`, or top-aligned when the
+        /// child is taller than the viewport.
+        #[test]
+        fn prop_reveal_containment(
+            initial_scroll in 0u16..=50u16,
+            focus_child  in 0usize..5usize,
+            viewport_h   in 3u16..=20u16,
+        ) {
+            let root = Node::Carousel {
+                id: 1,
+                orientation: Orientation::Vertical,
+                scroll: initial_scroll,
+                children: (0u64..5).map(|i| (5u16, Node::Tile(i))).collect(),
+            };
+            let area = Rect::new(0, 0, 10, viewport_h);
+            let mut tree = Tree::new(root);
+            tree.focus_set(focus_child as u64);
+            tree.scroll_focus_into_view(area);
+
+            let new_scroll   = get_scroll(&tree, 1) as u32;
+            let child_start  = focus_child as u32 * 5;
+            let ext: u32     = 5;
+            let main: u32    = viewport_h as u32;
+
+            if ext <= main {
+                prop_assert!(child_start >= new_scroll,
+                    "child start {child_start} < scroll {new_scroll}");
+                prop_assert!(child_start + ext <= new_scroll + main,
+                    "child end {} > scroll+vp {}", child_start + ext, new_scroll + main);
+            } else {
+                // Too-tall: top edge must be aligned.
+                prop_assert_eq!(new_scroll, child_start,
+                    "too-tall child: scroll must equal child_start");
+            }
         }
     }
 }
