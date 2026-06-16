@@ -44,7 +44,7 @@ use mullion::{
     Align, BorderStyle, Borders, Buffer, Cell, Constraint, CornerStyle, Label,
     LineWeight, Node, Orientation, Rect, Side, Size, Terminal, TileId, Tree,
     poll_event,
-    input::{InputRouter, KeyCode, KeyOutcome},
+    input::{InputRouter, Keymap, KeyCode, KeyOutcome},
     style::{Color, Modifier, Style},
 };
 
@@ -342,7 +342,7 @@ fn main() -> io::Result<()> {
 
 fn run(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let mut tree   = build_tree();
-    let mut router = InputRouter::new();
+    let mut router = InputRouter::with_keymap(Keymap::vim_prefix());
     let mut frame  = 0u64;
 
     loop {

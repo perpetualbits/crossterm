@@ -358,9 +358,9 @@ pub(crate) fn solve_into(node: &mut Node, area: Rect, out: &mut Vec<(TileId, Rec
 
             for (child_idx, v_start, ext) in entries {
                 // Clip the child's content span to the viewport.
-                let vis_content_start = (v_start as u32).max(clamped as u32);
+                let vis_content_start = v_start.max(clamped as u32);
                 let vis_content_end =
-                    (v_start as u32 + ext as u32).min(clamped as u32 + main_extent as u32);
+                    (v_start + ext as u32).min(clamped as u32 + main_extent as u32);
                 let vis_len = (vis_content_end - vis_content_start) as u16;
                 // Screen offset from viewport origin for the visible portion.
                 let screen_start = vp_main_origin + (vis_content_start - clamped as u32) as u16;

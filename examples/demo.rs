@@ -35,7 +35,7 @@ use crossterm::event::Event;
 use mullion::{
     backend::CrosstermBackend,
     focus_override, render_shared,
-    input::{InputRouter, KeyCode, KeyOutcome},
+    input::{InputRouter, Keymap, KeyCode, KeyOutcome},
     layout::{Constraint, Node, Orientation, Size, TileId},
     poll_event,
     style::{Color, Modifier, Style},
@@ -175,7 +175,7 @@ fn main() -> io::Result<()> {
 
 fn run(term: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let mut tree = build_tree();
-    let mut router = InputRouter::new();
+    let mut router = InputRouter::with_keymap(Keymap::vim_prefix());
 
     loop {
         term.draw(|buf| {

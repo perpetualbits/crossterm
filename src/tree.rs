@@ -345,8 +345,8 @@ fn reveal_focus_path(node: &mut Node, path: &[usize], rect: Rect) {
                 Axis::Horizontal => rect.x,
                 Axis::Vertical => rect.y,
             };
-            for i in 0..child_idx {
-                pos = pos.saturating_add(sizes[i]);
+            for &s in &sizes[..child_idx] {
+                pos = pos.saturating_add(s);
             }
             let size = sizes[child_idx];
             let child_rect = match axis {
@@ -395,10 +395,10 @@ fn reveal_focus_path(node: &mut Node, path: &[usize], rect: Rect) {
                 new = child_start;                                    // case 1: pull up
             } else if is_leaf_child && is_too_tall && child_start > new {
                 new = child_start;                                    // case 2: align top
-            } else if !is_too_tall || !is_leaf_child {
-                if child_start + ext as u32 > new + main_extent as u32 {
-                    new = child_start + ext as u32 - main_extent as u32; // case 3: reveal far edge
-                }
+            } else if (!is_too_tall || !is_leaf_child)
+                && child_start + ext as u32 > new + main_extent as u32
+            {
+                new = child_start + ext as u32 - main_extent as u32; // case 3: reveal far edge
             }
             let new_scroll = (new.min(u16::MAX as u32) as u16).min(max_scroll);
             *scroll = new_scroll;
@@ -615,7 +615,7 @@ impl Tree {
 
         // Move focus into the new subtree when it fell outside.
         let focus_valid = self.focus
-            .map_or(false, |fid| leaves(self.effective_root()).contains(&fid));
+            .is_some_and(|fid| leaves(self.effective_root()).contains(&fid));
         if !focus_valid {
             self.focus = leaves(self.effective_root()).into_iter().next();
         }

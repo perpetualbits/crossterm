@@ -252,7 +252,7 @@ fn draw_v_label(buf: &mut Buffer, rect: Rect, label: &Label, style: &Style) {
         // Build the per-slot virtual sequence for one period.
         let mut virtual_rows: Vec<&str> = narrow;
         // Append MARQUEE_GAP blank slots as the pause between repetitions.
-        virtual_rows.extend(std::iter::repeat(" ").take(MARQUEE_GAP as usize));
+        virtual_rows.extend(std::iter::repeat_n(" ", MARQUEE_GAP as usize));
 
         for k in 0..run_len {
             let slot = ((start + k) % period) as usize;
