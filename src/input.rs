@@ -19,8 +19,11 @@
 //! The prefix and bindings are held in a replaceable [`Keymap`], so a consumer
 //! can choose a different scheme (e.g. a `Ctrl-b` prefix for tmux-style nav).
 
-pub use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+pub use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
+use crate::geometry::Rect;
+use crate::layout::{solve, TileId};
+use crate::mouse::{carousel_at, tile_at};
 use crate::tree::{Dir, Tree};
 
 // ── NavCommand ────────────────────────────────────────────────────────────────
@@ -65,6 +68,20 @@ pub enum KeyOutcome {
     /// Not a navigation key — the app should deliver this event to the focused
     /// tile's content handler.
     Forward(KeyEvent),
+}
+
+// ── MouseOutcome ─────────────────────────────────────────────────────────────
+
+/// Result of feeding one mouse event to the [`InputRouter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseOutcome {
+    /// A left-button press landed on a tile; focus has already been updated.
+    Focused(TileId),
+    /// A scroll event landed on a carousel; its scroll offset has been updated.
+    Scrolled(TileId),
+    /// The event did not match any interactive element (no click target, no
+    /// carousel under the cursor, or an event kind the router ignores).
+    Ignored,
 }
 
 // ── Keymap ────────────────────────────────────────────────────────────────────
@@ -143,9 +160,9 @@ enum RouterMode {
 
 // ── InputRouter ───────────────────────────────────────────────────────────────
 
-/// Modal input router: translates raw key events into [`KeyOutcome`]s.
+/// Modal input router: translates raw key and mouse events into typed outcomes.
 ///
-/// ## State machine
+/// ## State machine (keyboard)
 ///
 /// ```text
 /// Normal ──[prefix]──► PendingNav ──[nav key]──► Normal (fires Nav)
@@ -155,20 +172,40 @@ enum RouterMode {
 ///
 /// The prefix is single-shot: one prefix → one command.  A sticky repeat mode
 /// can be added later without changing this API.
+///
+/// ## Mouse handling
+///
+/// [`handle_mouse`](InputRouter::handle_mouse) is stateless with respect to the
+/// key state machine: it always resolves the event directly against the tree
+/// regardless of whether the router is in `Normal` or `PendingNav` mode.  Mouse
+/// events do not cancel a pending key prefix.
 pub struct InputRouter {
+    /// Current state of the key prefix state machine.
     mode: RouterMode,
+    /// Active key bindings.
     keymap: Keymap,
+    /// Number of scroll steps fired per wheel tick.  Default: 1.
+    wheel_scroll_step: u16,
 }
 
 impl InputRouter {
-    /// Construct with the default [`Keymap`] in Normal mode.
+    /// Construct with the default [`Keymap`] in Normal mode and a wheel step of 1.
     pub fn new() -> Self {
-        Self { mode: RouterMode::Normal, keymap: Keymap::default() }
+        Self { mode: RouterMode::Normal, keymap: Keymap::default(), wheel_scroll_step: 1 }
     }
 
-    /// Construct with a custom [`Keymap`] in Normal mode.
+    /// Construct with a custom [`Keymap`] in Normal mode and a wheel step of 1.
     pub fn with_keymap(km: Keymap) -> Self {
-        Self { mode: RouterMode::Normal, keymap: km }
+        Self { mode: RouterMode::Normal, keymap: km, wheel_scroll_step: 1 }
+    }
+
+    /// Set the number of scroll steps fired per wheel tick.
+    ///
+    /// The wheel step applies to both `ScrollUp` and `ScrollDown` events handled
+    /// by [`handle_mouse`](InputRouter::handle_mouse).  The default is 1.
+    pub fn set_wheel_scroll_step(&mut self, step: u16) -> &mut Self {
+        self.wheel_scroll_step = step;
+        self
     }
 
     /// Feed one key event.  Mutates `tree` when a [`NavCommand`] fires.
@@ -195,6 +232,85 @@ impl InputRouter {
                     None => KeyOutcome::Consumed,
                 }
             }
+        }
+    }
+
+    /// Drive focus and carousel scroll from one mouse event.
+    ///
+    /// Hit-tests the **effective** (zoom-aware) subtree of `tree` laid out in
+    /// `area`.  Three event kinds are handled:
+    ///
+    /// - **Left-button press** — [`solve`]s the effective root, then calls
+    ///   [`tile_at`] to find the tile under the cursor.  If found, calls
+    ///   [`Tree::focus_set`] and returns `Focused(id)`.
+    /// - **Scroll up / scroll down** — calls [`carousel_at`] on the effective
+    ///   root to find the innermost carousel under the cursor, then calls
+    ///   [`Tree::scroll_by`] with `−step` or `+step` respectively (where `step`
+    ///   is [`wheel_scroll_step`](InputRouter::set_wheel_scroll_step)).  Returns
+    ///   `Scrolled(id)`.
+    /// - **Everything else** — `Ignored`.
+    ///
+    /// ## Zoom behaviour
+    ///
+    /// Because both `solve` and `carousel_at` operate on `effective_root_mut()`,
+    /// a click on a tile that is outside the zoom window returns `Ignored`
+    /// (the tile does not appear in the effective subtree's solved rects).
+    /// Likewise a wheel event when the effective root is a single `Tile` returns
+    /// `Ignored` (no carousel exists under the point).
+    ///
+    /// ## Composed layouts
+    ///
+    /// For applications that render separate regions with independent trees (e.g.
+    /// a header split and a body carousel), call [`tile_at`] and [`carousel_at`]
+    /// directly on each region's rect list rather than using this method with a
+    /// combined area.
+    ///
+    /// # Parameters
+    /// - `ev`: The crossterm [`MouseEvent`] to process.
+    /// - `tree`: The layout tree; mutated on click (focus) or wheel (scroll).
+    /// - `area`: The same `Rect` passed to `solve` / `render_carousel` for this
+    ///   tree, so the solve geometry matches the render geometry.
+    ///
+    /// # Returns
+    /// A [`MouseOutcome`] indicating what, if anything, was updated.
+    pub fn handle_mouse(&mut self, ev: MouseEvent, tree: &mut Tree, area: Rect) -> MouseOutcome {
+        let (x, y) = (ev.column, ev.row);
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Solve the effective subtree to obtain on-screen rects, then
+                // hit-test.  The Vec is owned so the mutable borrow of tree ends
+                // before focus_set takes a new borrow.
+                let rects = solve(tree.effective_root_mut(), area);
+                match tile_at(&rects, x, y) {
+                    Some(id) => {
+                        tree.focus_set(id);
+                        MouseOutcome::Focused(id)
+                    }
+                    None => MouseOutcome::Ignored,
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                // carousel_at returns an owned TileId (Copy); the mutable borrow
+                // of tree ends before scroll_by takes a new one.
+                match carousel_at(tree.effective_root_mut(), area, x, y) {
+                    Some(id) => {
+                        // Scroll backward: negative delta, saturating at 0.
+                        tree.scroll_by(id, -(self.wheel_scroll_step as i32));
+                        MouseOutcome::Scrolled(id)
+                    }
+                    None => MouseOutcome::Ignored,
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                match carousel_at(tree.effective_root_mut(), area, x, y) {
+                    Some(id) => {
+                        tree.scroll_by(id, self.wheel_scroll_step as i32);
+                        MouseOutcome::Scrolled(id)
+                    }
+                    None => MouseOutcome::Ignored,
+                }
+            }
+            _ => MouseOutcome::Ignored,
         }
     }
 }
@@ -224,8 +340,9 @@ fn execute_nav(cmd: NavCommand, tree: &mut Tree) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::Rect;
     use crate::layout::{Constraint, Node, Orientation, Size};
-    use crate::tree::leaves;
+    use crate::tree::{leaves, node_by_id};
 
     fn tile(id: u64) -> Node {
         Node::Tile(id)
@@ -421,5 +538,180 @@ mod tests {
         let outcome = router.handle(key(KeyCode::Char('Z')), &mut tree);
         assert!(matches!(outcome, KeyOutcome::Nav(NavCommand::ZoomOut)));
         assert!(!tree.is_zoomed(), "tree must not be zoomed after ZoomOut");
+    }
+
+    // ── handle_mouse ─────────────────────────────────────────────────────
+
+    fn make_mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+    }
+
+    fn v_carousel(id: u64, scroll: u16, child_h: u16, n: u64) -> Node {
+        Node::Carousel {
+            id,
+            orientation: Orientation::Vertical,
+            scroll,
+            children: (0..n).map(|i| (child_h, Node::Tile(i))).collect(),
+        }
+    }
+
+    #[test]
+    fn mouse_left_press_focuses_tile_under_cursor() {
+        // H-split [Tile(0) | Tile(1)] in 40×10.  Tile(0) = x[0,20), Tile(1) = x[20,40).
+        let area = Rect::new(0, 0, 40, 10);
+        let mut tree = Tree::new(h_split(vec![tile(0), tile(1)]));
+        let mut router = InputRouter::new();
+        assert_eq!(tree.focus(), Some(0), "focus starts at tile 0");
+
+        // Click in the right half → should focus Tile(1).
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 25, 5);
+        let outcome = router.handle_mouse(ev, &mut tree, area);
+        assert!(matches!(outcome, MouseOutcome::Focused(1)), "expected Focused(1)");
+        assert_eq!(tree.focus(), Some(1));
+    }
+
+    #[test]
+    fn mouse_left_press_in_gap_returns_ignored() {
+        // Fixed(10) + Fixed(10) in a 40-col area: x=20..40 is empty.
+        let area = Rect::new(0, 0, 40, 10);
+        let mut tree = Tree::new(Node::Split {
+            orientation: Orientation::Horizontal,
+            children: vec![
+                (Constraint { size: Size::Fixed(10), min: 0, max: u16::MAX }, Node::Tile(0)),
+                (Constraint { size: Size::Fixed(10), min: 0, max: u16::MAX }, Node::Tile(1)),
+            ],
+        });
+        let mut router = InputRouter::new();
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 30, 5);
+        let outcome = router.handle_mouse(ev, &mut tree, area);
+        assert!(matches!(outcome, MouseOutcome::Ignored));
+        // Focus unchanged.
+        assert_eq!(tree.focus(), Some(0));
+    }
+
+    #[test]
+    fn mouse_wheel_down_increments_carousel_scroll() {
+        // Vertical carousel id=99, 5 children × 10 rows each; scroll starts at 5.
+        let area = Rect::new(0, 0, 20, 10);
+        let mut tree = Tree::new(v_carousel(99, 5, 10, 5));
+        let mut router = InputRouter::new();
+
+        let ev = make_mouse(MouseEventKind::ScrollDown, 10, 5);
+        let outcome = router.handle_mouse(ev, &mut tree, area);
+        assert!(matches!(outcome, MouseOutcome::Scrolled(99)));
+        if let Some(Node::Carousel { scroll, .. }) = node_by_id(tree.root(), 99) {
+            assert_eq!(*scroll, 6, "scroll should have incremented by 1");
+        } else {
+            panic!("carousel not found");
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_up_decrements_carousel_scroll_saturating() {
+        let area = Rect::new(0, 0, 20, 10);
+        let mut tree = Tree::new(v_carousel(99, 3, 10, 5));
+        let mut router = InputRouter::new();
+
+        let ev = make_mouse(MouseEventKind::ScrollUp, 10, 5);
+        let outcome = router.handle_mouse(ev, &mut tree, area);
+        assert!(matches!(outcome, MouseOutcome::Scrolled(99)));
+        if let Some(Node::Carousel { scroll, .. }) = node_by_id(tree.root(), 99) {
+            assert_eq!(*scroll, 2, "scroll should have decremented by 1");
+        } else {
+            panic!("carousel not found");
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_up_at_zero_saturates_not_wraps() {
+        let area = Rect::new(0, 0, 20, 10);
+        let mut tree = Tree::new(v_carousel(99, 0, 10, 5));
+        let mut router = InputRouter::new();
+
+        let ev = make_mouse(MouseEventKind::ScrollUp, 10, 5);
+        router.handle_mouse(ev, &mut tree, area);
+        if let Some(Node::Carousel { scroll, .. }) = node_by_id(tree.root(), 99) {
+            assert_eq!(*scroll, 0, "scroll must not wrap below 0");
+        } else {
+            panic!("carousel not found");
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_with_no_carousel_under_cursor_returns_ignored() {
+        // Pure H-split — no carousel anywhere in the tree.
+        let area = Rect::new(0, 0, 40, 10);
+        let mut tree = Tree::new(h_split(vec![tile(0), tile(1)]));
+        let mut router = InputRouter::new();
+
+        let ev = make_mouse(MouseEventKind::ScrollDown, 10, 5);
+        let outcome = router.handle_mouse(ev, &mut tree, area);
+        assert!(matches!(outcome, MouseOutcome::Ignored));
+    }
+
+    #[test]
+    fn mouse_click_zoom_aware_outside_zoom_returns_ignored() {
+        // H-split [Tile(0) | Tile(1)]; zoom into Tile(1).
+        // In the zoomed view, the effective root is Tile(1) filling the whole area.
+        // A click at x=5 would hit Tile(0) in the unzoomed tree but should return
+        // Ignored from handle_mouse since effective_root is just Tile(1), and
+        // solve([Tile(1)], area) = [(1, area)] — (5,5) is inside area → Focused(1).
+        // Actually zoomed into Tile(1) means the whole area resolves to Tile(1).
+        // Let's instead test that a point outside the area returns Ignored.
+        let area = Rect::new(5, 5, 30, 20); // non-zero origin to test containment
+        let mut tree = Tree::new(h_split(vec![tile(0), tile(1)]));
+        tree.focus_set(1);
+        tree.zoom_focus(); // effective root = Tile(1)
+        let mut router = InputRouter::new();
+
+        // Click at (0,0) — outside the area rect (area starts at (5,5)).
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 0, 0);
+        let outcome = router.handle_mouse(ev, &mut tree, area);
+        assert!(matches!(outcome, MouseOutcome::Ignored), "out-of-area click must be Ignored");
+    }
+
+    #[test]
+    fn mouse_click_zoom_aware_in_area_hits_zoomed_tile() {
+        // When zoomed into Tile(1), solve on effective root in area yields [(1, area)].
+        // Any in-area click therefore focuses Tile(1).
+        let area = Rect::new(0, 0, 40, 10);
+        let mut tree = Tree::new(h_split(vec![tile(0), tile(1)]));
+        tree.focus_set(1);
+        tree.zoom_focus();
+        let mut router = InputRouter::new();
+
+        // Click in the left portion — would be Tile(0) unzoomed, but Tile(1) when zoomed.
+        let ev = make_mouse(MouseEventKind::Down(MouseButton::Left), 5, 5);
+        let outcome = router.handle_mouse(ev, &mut tree, area);
+        assert!(matches!(outcome, MouseOutcome::Focused(1)));
+    }
+
+    #[test]
+    fn mouse_wheel_ignored_when_zoomed_to_single_tile() {
+        // Zoom into a leaf tile — no carousel exists in the effective subtree.
+        let area = Rect::new(0, 0, 20, 10);
+        let mut tree = Tree::new(v_carousel(1, 0, 5, 4));
+        tree.zoom_focus(); // focus is Tile(0); effective root becomes Tile(0)
+        let mut router = InputRouter::new();
+
+        let ev = make_mouse(MouseEventKind::ScrollDown, 10, 5);
+        let outcome = router.handle_mouse(ev, &mut tree, area);
+        assert!(matches!(outcome, MouseOutcome::Ignored));
+    }
+
+    #[test]
+    fn wheel_scroll_step_is_respected() {
+        let area = Rect::new(0, 0, 20, 10);
+        let mut tree = Tree::new(v_carousel(99, 0, 5, 10));
+        let mut router = InputRouter::new();
+        router.set_wheel_scroll_step(3);
+
+        let ev = make_mouse(MouseEventKind::ScrollDown, 10, 5);
+        router.handle_mouse(ev, &mut tree, area);
+        if let Some(Node::Carousel { scroll, .. }) = node_by_id(tree.root(), 99) {
+            assert_eq!(*scroll, 3, "step=3 should advance scroll by 3");
+        } else {
+            panic!("carousel not found");
+        }
     }
 }

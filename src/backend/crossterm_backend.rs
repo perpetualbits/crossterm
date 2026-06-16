@@ -4,6 +4,7 @@ use std::io::{self, Write};
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute, queue,
     style::{
         Attribute, Color as CtColor, Colors, Print, ResetColor, SetAttribute,
@@ -40,6 +41,16 @@ const END_SYNC: &[u8] = b"\x1b[?2026l";
 /// restore sequences to stderr *before* printing the panic message, keeping it
 /// readable while in raw mode.
 ///
+/// ## Mouse capture
+///
+/// By default `enter` enables mouse reporting so click and scroll events are
+/// delivered as `crossterm::event::MouseEvent`.  Call
+/// [`set_mouse_capture(false)`](CrosstermBackend::set_mouse_capture) before
+/// `enter` to opt out (e.g. when the user prefers native terminal text selection).
+/// `leave` (and the panic/Drop restore path) will always emit
+/// `DisableMouseCapture` when capture is enabled so the terminal is reliably
+/// restored.
+///
 /// ## Style minimization
 ///
 /// [`draw`](Backend::draw) tracks the last SGR (Select Graphic Rendition)
@@ -56,22 +67,43 @@ pub struct CrosstermBackend<W: Write> {
     /// [`leave`](Backend::leave).  Guards the [`Drop`] restore so we do not emit
     /// escape sequences when we were never in interactive mode.
     entered: bool,
+    /// Whether to enable mouse capture on [`enter`](Backend::enter).
+    /// Default: `true`.  Set via [`set_mouse_capture`](CrosstermBackend::set_mouse_capture).
+    mouse_enabled: bool,
 }
 
 impl<W: Write> CrosstermBackend<W> {
     /// Wrap `writer` in a new backend, starting in the non-interactive state.
+    ///
+    /// Mouse capture is enabled by default; call [`set_mouse_capture(false)`](CrosstermBackend::set_mouse_capture)
+    /// before [`enter`](Backend::enter) to opt out.
     pub fn new(writer: W) -> Self {
-        Self { writer, last_style: None, entered: false }
+        Self { writer, last_style: None, entered: false, mouse_enabled: true }
+    }
+
+    /// Enable or disable mouse capture for the next [`enter`](Backend::enter) call.
+    ///
+    /// When `enabled` is `false`, neither `EnableMouseCapture` nor
+    /// `DisableMouseCapture` is emitted, allowing the user to use native terminal
+    /// text selection instead.  Must be called before `enter`; changing this after
+    /// `enter` has been called has no effect on the current session.
+    pub fn set_mouse_capture(&mut self, enabled: bool) {
+        self.mouse_enabled = enabled;
     }
 
     /// Write the escape sequences that restore the terminal to its normal state.
     ///
-    /// Emits `LeaveAlternateScreen` and `Show` (show cursor) to `self.writer`
-    /// and flushes.  Deliberately does **not** call `disable_raw_mode`, which is
-    /// a tty syscall and therefore unavailable in tests using a `Vec<u8>` sink.
-    /// [`leave`](Backend::leave) calls both.
+    /// Emits (in order): `DisableMouseCapture` (if mouse_enabled), `LeaveAlternateScreen`,
+    /// `Show` (show cursor).  Deliberately does **not** call `disable_raw_mode`,
+    /// which is a tty syscall and therefore unavailable in tests using a `Vec<u8>`
+    /// sink.  [`leave`](Backend::leave) calls `write_restore` and then
+    /// `disable_raw_mode`.
     fn write_restore(&mut self) -> io::Result<()> {
-        execute!(self.writer, LeaveAlternateScreen, Show)
+        if self.mouse_enabled {
+            execute!(self.writer, DisableMouseCapture, LeaveAlternateScreen, Show)
+        } else {
+            execute!(self.writer, LeaveAlternateScreen, Show)
+        }
     }
 
     /// Simulate having entered interactive mode without calling `enable_raw_mode`.
@@ -234,7 +266,7 @@ impl<W: Write> Backend for CrosstermBackend<W> {
         self.writer.flush()
     }
 
-    /// Enter interactive mode: raw mode, alternate screen, hidden cursor.
+    /// Enter interactive mode: raw mode, alternate screen, hidden cursor, mouse capture.
     ///
     /// Steps (in order):
     /// 1. Enable raw mode so keystrokes are delivered immediately without
@@ -242,8 +274,10 @@ impl<W: Write> Backend for CrosstermBackend<W> {
     /// 2. Enter the alternate screen buffer so the normal shell output is
     ///    preserved and restored on exit.
     /// 3. Hide the cursor to prevent it from flickering over the UI.
-    /// 4. Set `entered = true` to arm the [`Drop`] guard.
-    /// 5. Install a panic hook that emits restore sequences to stderr before
+    /// 4. Enable mouse capture (if [`mouse_enabled`](CrosstermBackend::set_mouse_capture)
+    ///    is `true`) so click and scroll events are delivered.
+    /// 5. Set `entered = true` to arm the [`Drop`] guard.
+    /// 6. Install a panic hook that emits restore sequences to stderr before
     ///    printing the panic message.  Without this, a panic in raw mode
     ///    produces garbled output because the terminal is still in raw mode
     ///    when the default panic handler writes to stderr.
@@ -255,15 +289,27 @@ impl<W: Write> Backend for CrosstermBackend<W> {
     fn enter(&mut self) -> io::Result<()> {
         enable_raw_mode()?;
         execute!(self.writer, EnterAlternateScreen, Hide)?;
+        if self.mouse_enabled {
+            // Enable basic button press/release, button-motion, and SGR mouse
+            // (extended coords for wide terminals).
+            execute!(self.writer, EnableMouseCapture)?;
+        }
         self.entered = true;
 
+        // Capture mouse_enabled at hook-install time so the panic closure can
+        // emit the matching disable sequence without accessing self.
+        let mouse_enabled_for_hook = self.mouse_enabled;
         // Chain the new hook onto the existing one so that any hook previously
         // installed (e.g. by a test framework) still runs.
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             // These are best-effort; the main cleanup path is the Drop impl.
             let _ = disable_raw_mode();
-            let _ = execute!(std::io::stderr(), LeaveAlternateScreen, Show);
+            if mouse_enabled_for_hook {
+                let _ = execute!(std::io::stderr(), DisableMouseCapture, LeaveAlternateScreen, Show);
+            } else {
+                let _ = execute!(std::io::stderr(), LeaveAlternateScreen, Show);
+            }
             prev(info);
         }));
 
@@ -310,6 +356,8 @@ mod tests {
         let out = String::from_utf8_lossy(&buf);
         assert!(out.contains("\x1b[?1049l"), "missing leave-alt-screen in: {out:?}");
         assert!(out.contains("\x1b[?25h"), "missing show-cursor in: {out:?}");
+        // Default mouse_enabled=true → leave must also disable mouse capture.
+        assert!(out.contains("\x1b[?1000l"), "missing disable-mouse in: {out:?}");
     }
 
     #[test]
@@ -322,5 +370,23 @@ mod tests {
         let out = String::from_utf8_lossy(&buf);
         assert!(out.contains("\x1b[?1049l"), "Drop must emit leave-alt-screen");
         assert!(out.contains("\x1b[?25h"), "Drop must emit show-cursor");
+        assert!(out.contains("\x1b[?1000l"), "Drop must disable mouse capture");
+    }
+
+    #[test]
+    fn leave_omits_mouse_disable_when_capture_disabled() {
+        let mut buf = Vec::<u8>::new();
+        {
+            let mut backend = CrosstermBackend::new(&mut buf);
+            backend.set_mouse_capture(false);
+            backend.mark_entered();
+            backend.leave().unwrap();
+        }
+        let out = String::from_utf8_lossy(&buf);
+        assert!(!out.contains("\x1b[?1000l"),
+            "set_mouse_capture(false) must suppress disable-mouse: {out:?}");
+        // Normal restore sequences must still be present.
+        assert!(out.contains("\x1b[?1049l"), "leave-alt-screen must still appear");
+        assert!(out.contains("\x1b[?25h"), "show-cursor must still appear");
     }
 }
