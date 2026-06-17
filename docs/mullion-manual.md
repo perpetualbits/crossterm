@@ -496,7 +496,226 @@ Common re-exports at the crate root: `Buffer`, `Cell`, `Node`, `Constraint`,
 
 ---
 
-## 5. Examples
+## 5. A complete application
+
+Sections 1–4 cover each piece in isolation. This section assembles them into a
+working application with the shape aerie (and most monitors) actually have: static
+chrome (header/footer), a scrollable body of live rows, focus, drill-down, and a
+loop driven by **two clocks** — a slow *data tick* that mutates state and a fast
+*render tick* that redraws. Every pattern here is the one `examples/showcase.rs`
+validates; this is the composition to copy.
+
+### 5.1 State: central, no registry
+
+Keep your domain data in one place and let `TileId` join it to the tree. The engine
+never stores your content — it hands you a rect, you look the row up by id and paint
+it. The `Tree` holds only what is *navigable* (the carousel of rows); the header and
+footer are static chrome drawn by plain arithmetic, not tree nodes.
+
+```rust
+use mullion::{Buffer, Node, Orientation};
+use mullion::tree::{Tree, Direction, id_from_key, reconcile_carousel, node_by_id_mut};
+use mullion::geometry::Rect;
+use std::collections::HashMap;
+
+const BODY: u64 = 0;          // the carousel's own id
+const ROW_H: u16 = 4;         // each row is 4 cells tall
+
+struct Group { label: String, load: f32 }   // your domain row
+
+struct App {
+    tree:   Tree,                       // holds the BODY carousel
+    groups: HashMap<u64, Group>,        // TileId -> row data (central state)
+    frame:  u64,
+}
+
+impl App {
+    fn new() -> Self {
+        let body = Node::Carousel { id: BODY, orientation: Orientation::Vertical,
+                                    scroll: 0, children: Vec::new() };
+        App { tree: Tree::new(body), groups: HashMap::new(), frame: 0 }
+    }
+}
+```
+
+### 5.2 The data tick: reconcile to fresh data
+
+When new data arrives, derive a stable `TileId` per row from its durable label with
+`id_from_key`, then `reconcile_carousel` the body. Survivors keep their scroll and
+focus; vanished rows drop; new rows appear — all without disturbing the user's place
+(§3.5). Re-validate focus and zoom afterward in case the focused/zoomed row vanished.
+
+```rust
+impl App {
+    fn on_data(&mut self, fresh: Vec<Group>) {
+        // 1. Rebuild the id -> data map and the desired (id, extent) list together.
+        let mut desired = Vec::with_capacity(fresh.len());
+        self.groups.clear();
+        for g in fresh {
+            let id = id_from_key(&g.label);     // stable identity from the label
+            desired.push((id, ROW_H));
+            self.groups.insert(id, g);
+        }
+        // 2. Reconcile the carousel's children to match (preserves survivors).
+        if let Some(body) = node_by_id_mut(self.tree.root_mut(), BODY) {
+            reconcile_carousel(body, &desired);
+        }
+        // 3. The focused or zoomed row may have just disappeared.
+        self.tree.ensure_focus_valid();
+        self.tree.ensure_zoom_valid();
+    }
+}
+```
+
+> **Data-layer virtualization.** If sampling each row's data is expensive, fetch only
+> for on-screen rows: `carousel_visible_range(body, body_area)` (§3.6) gives the
+> visible child index range, so you can skip work for rows the user can't see — the
+> same virtualization the renderer already does, applied to your data.
+
+### 5.3 The render tick: chrome, then body, then dispatch on zoom
+
+Chrome is arithmetic; the body is either the smooth carousel (overview) or a single
+filled tile (drilled in). The crucial detail is the **borrow discipline**: read
+focus and zoom state through *shared* borrows that end *before* you take the `&mut`
+for `render_carousel`, and let `draw_child` capture only `Copy` values (ids,
+counters) so it never borrows the tree (Lesson 1).
+
+```rust
+use mullion::render::render_carousel;
+
+fn chrome(area: Rect) -> (Rect, Rect, u16) {     // (header, body, footer_y)
+    let header_h = 1u16.min(area.height);
+    let footer_y = area.height.saturating_sub(1);
+    let body = Rect::new(0, header_h, area.width, footer_y.saturating_sub(header_h));
+    (Rect::new(0, 0, area.width, header_h), body, footer_y)
+}
+
+impl App {
+    fn render(&mut self, buf: &mut Buffer) {
+        let area = buf.area;
+        if area.height < 4 { return; }
+        let (header, body_area, footer_y) = chrome(area);
+
+        // Header / footer: plain text into computed rects.
+        buf.set_string(header.x, header.y, "aerie — fleet monitor", Default::default());
+        buf.set_string(0, footer_y, "[\u{2191}\u{2193}] focus  [\u{21B5}] open  [esc] back  [q] quit", Default::default());
+
+        // Auto-reveal must use the SAME body rect the carousel renders into.
+        self.tree.scroll_focus_into_view(body_area);
+
+        // --- shared borrows: read state, then let them end ---
+        let focused = self.tree.focus();
+        let zoomed_row = match self.tree.effective_root() {     // borrow ends at `}`
+            Node::Tile(id) => Some(*id),
+            _ => None,
+        };
+        let groups = &self.groups;                              // shared, Copy-free capture below uses ids only
+        let frame = self.frame;
+
+        // draw one row by id — looks data up centrally, never touches the tree.
+        let mut draw_row = |buf: &mut Buffer, id: u64, rect: Rect| {
+            if let Some(g) = groups.get(&id) {
+                let mark = if Some(id) == focused { '\u{25B6}' } else { ' ' };
+                buf.set_string(rect.x, rect.y, &format!("{mark} {}", g.label), Default::default());
+                let bar = (g.load * rect.width as f32) as u16;
+                buf.set_string(rect.x, rect.y + 1, &"\u{2588}".repeat(bar as usize), Default::default());
+                let _ = frame; // (animate marquees / spinners off `frame` here)
+            }
+        };
+
+        // --- dispatch: drilled into one row, or the carousel overview ---
+        if let Some(id) = zoomed_row {
+            draw_row(buf, id, body_area);                       // detail fills the body
+        } else {
+            render_carousel(buf, self.tree.effective_root_mut(), body_area, &mut draw_row);
+        }
+    }
+}
+```
+
+### 5.4 Input: the app owns the mode
+
+mullion never tracks "am I inside a row." *You* decide: plain arrows move focus,
+Enter drills in, Esc backs out, everything else is yours (or forwarded to the
+focused row's content). These are direct `Tree` calls — no router required.
+
+```rust
+use mullion::input::{KeyCode, KeyEvent};
+
+impl App {
+    /// Returns true to quit.
+    fn on_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Up    => { self.tree.focus_dir(Direction::Up);   false }
+            KeyCode::Down  => { self.tree.focus_dir(Direction::Down); false }
+            KeyCode::Enter => { self.tree.zoom_focus();               false }  // drill in
+            KeyCode::Esc   => { self.tree.zoom_out();                 false }  // back out
+            KeyCode::Char('q') => true,
+            _ => {
+                // Forward to the focused row: metric toggles, sort keys, etc.
+                // (e.g. dispatch on self.tree.focus())
+                false
+            }
+        }
+    }
+}
+```
+
+`focus_dir` stays inside the carousel and wraps (§3.4); `zoom_focus`/`zoom_out`
+push and pop the drill-down stack (§3.7). To cross between non-carousel panes use
+`focus_dir_cross` on Shift+arrows.
+
+### 5.5 The loop: two clocks
+
+`poll_event` with a timeout *is* the render clock — when it times out you redraw and
+advance animation; when data is due you reconcile. `term.draw` diffs and flushes only
+changed cells, so redrawing every ~50 ms is cheap even when nothing moved.
+
+```rust
+use mullion::{Terminal, backend::CrosstermBackend};
+use mullion::input::poll_event;            // mullion re-exports KeyEvent/KeyCode/…
+use crossterm::event::Event;               // …but `Event` itself comes from crossterm
+use std::{io, time::{Duration, Instant}};
+
+fn main() -> io::Result<()> {
+    let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    term.enter()?;                                  // raw mode, alt screen, hidden cursor
+    let mut app = App::new();
+    app.on_data(initial_groups());                  // first data tick
+    let mut last_data = Instant::now();
+
+    let result = (|| -> io::Result<()> {
+        loop {
+            term.draw(|buf| app.render(buf))?;      // render tick
+            app.frame = app.frame.wrapping_add(1);
+
+            match poll_event(Duration::from_millis(50))? {
+                Some(Event::Key(key)) => { if app.on_key(key) { break } }
+                _ => {}                              // timeout or resize → just redraw
+            }
+            if last_data.elapsed() >= Duration::from_secs(2) {
+                app.on_data(sample_groups());        // data tick
+                last_data = Instant::now();
+            }
+        }
+        Ok(())
+    })();
+
+    term.leave()?;                                   // restore the terminal even on error
+    result
+}
+# fn initial_groups() -> Vec<Group> { Vec::new() }
+# fn sample_groups()  -> Vec<Group> { Vec::new() }
+```
+
+That is the whole architecture: central state joined to the tree by `TileId`,
+`reconcile_carousel` on the data clock, a render that dispatches between carousel and
+drilled-in tile, and app-owned input — every other feature (labels, theming, mouse,
+`focus_dir_cross`, degraded fallback) slots into these same four methods.
+
+---
+
+## 6. Example programs
 
 **`examples/quickstart.rs`** — the compilable version of the §2 getting-started
 snippet.  Uses `Buffer::empty` and an in-memory render (no real terminal needed):
@@ -518,7 +737,7 @@ cargo run --example showcase
 
 ---
 
-## 6. Status & roadmap
+## 7. Status & roadmap
 
 **Complete (Phases 0–7):**
 
