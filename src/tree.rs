@@ -258,6 +258,35 @@ pub fn reconcile_split(node: &mut Node, desired: &[(TileId, Constraint)]) {
         .collect();
 }
 
+// ── id_from_key ──────────────────────────────────────────────────────────────
+
+/// Derive a [`TileId`] by hashing any hashable domain key.
+///
+/// Equal keys always produce equal ids within a build; distinct keys produce
+/// distinct ids (assuming no hash collision).  Intended for turning durable
+/// domain labels (a VM id, a cgroup path, a row key) into stable `TileId`s
+/// that survive tree reconciles without explicit allocation:
+///
+/// ```rust
+/// # use mullion::tree::id_from_key;
+/// let vm_id: u32 = 42;
+/// let tile_id = id_from_key(vm_id);
+/// // Use tile_id in reconcile_carousel; the same vm_id always gives the same tile_id.
+/// ```
+///
+/// ## Stability
+///
+/// Deterministic within a build: the same key always hashes to the same id in
+/// the same binary.  **Not** stable across Rust compiler versions or platforms
+/// — do not persist these ids to disk or transmit them over the network.
+pub fn id_from_key(key: impl std::hash::Hash) -> TileId {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+    let mut h = DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
 // ── Dir ───────────────────────────────────────────────────────────────────────
 
 /// Direction for a sibling swap within a [`Split`](Node::Split).
@@ -564,6 +593,52 @@ impl Tree {
             node_by_id_mut(&mut self.root, id).unwrap()
         } else {
             &mut self.root
+        }
+    }
+
+    /// Run `f` with mutable access to the **effective** (zoom-aware) root and the
+    /// current focus, returning its result.
+    ///
+    /// Scopes the mutable borrow to this `Tree`, so a render closure can
+    /// disjointly borrow other fields of an enclosing struct — no
+    /// `Option<Tree>` / take-restore needed:
+    ///
+    /// ```rust
+    /// # use mullion::{Node, Rect, layout::solve, tree::Tree};
+    /// # fn demo(mut tree: Tree, area: Rect) {
+    /// let rects = tree.with_effective_root_mut(|root, _focus| solve(root, area));
+    /// # }
+    /// ```
+    pub fn with_effective_root_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut Node, Option<TileId>) -> R,
+    ) -> R {
+        let focus = self.focus;
+        f(self.effective_root_mut(), focus)
+    }
+
+    /// The id of the effective root when it is addressable.
+    ///
+    /// Returns the `TileId` when the effective root is a `Tile` or `Carousel`,
+    /// and `None` when it is a `Split` (which carries no id).  Lets a consumer
+    /// dispatch without re-matching the node:
+    ///
+    /// ```rust
+    /// # use mullion::{Node, tree::Tree};
+    /// # fn demo(tree: &Tree) {
+    /// // Branch: zoomed into a single tile vs. the carousel overview.
+    /// match tree.effective_root() {
+    ///     Node::Tile(id)        => { /* render detail view for *id */ }
+    ///     Node::Carousel { .. } => { /* render the carousel */ }
+    ///     Node::Split { .. }    => { /* render the split skeleton */ }
+    /// }
+    /// # }
+    /// ```
+    pub fn effective_root_id(&self) -> Option<TileId> {
+        match self.effective_root() {
+            Node::Tile(id) => Some(*id),
+            Node::Carousel { id, .. } => Some(*id),
+            Node::Split { .. } => None,
         }
     }
 
@@ -2375,5 +2450,117 @@ mod tests {
         reconcile_split(&mut node, &[(10, c)]);
         let Node::Carousel { children, .. } = &node else { panic!() };
         assert_eq!(children.len(), 1, "carousel must be unchanged");
+    }
+
+    // ── id_from_key ───────────────────────────────────────────────────────
+
+    #[test]
+    fn id_from_key_equal_keys_give_equal_ids() {
+        assert_eq!(id_from_key("hello"), id_from_key("hello"));
+        assert_eq!(id_from_key(42u32), id_from_key(42u32));
+        assert_eq!(id_from_key((1u32, "vm")), id_from_key((1u32, "vm")));
+    }
+
+    #[test]
+    fn id_from_key_distinct_keys_give_distinct_ids() {
+        assert_ne!(id_from_key("vm-1"), id_from_key("vm-2"));
+        assert_ne!(id_from_key(0u32), id_from_key(1u32));
+    }
+
+    #[test]
+    fn id_from_key_deterministic_across_calls() {
+        let a = id_from_key("cgroup/root/my-process");
+        let b = id_from_key("cgroup/root/my-process");
+        let c = id_from_key("cgroup/root/my-process");
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    // ── effective_root_id ─────────────────────────────────────────────────
+
+    #[test]
+    fn effective_root_id_none_for_split_root() {
+        let tree = Tree::new(h_split(vec![tile(1), tile(2)]));
+        assert_eq!(tree.effective_root_id(), None);
+    }
+
+    #[test]
+    fn effective_root_id_carousel_when_rooted_at_carousel() {
+        let tree = Tree::new(carousel(42, vec![tile(1), tile(2)]));
+        assert_eq!(tree.effective_root_id(), Some(42));
+    }
+
+    #[test]
+    fn effective_root_id_tile_when_zoomed_into_tile() {
+        let mut tree = Tree::new(h_split(vec![tile(10), tile(20)]));
+        assert!(tree.zoom_to(10));
+        assert_eq!(tree.effective_root_id(), Some(10));
+    }
+
+    #[test]
+    fn effective_root_id_carousel_when_zoomed_into_carousel() {
+        let mut tree = Tree::new(h_split(vec![
+            tile(0),
+            carousel(99, vec![tile(1), tile(2)]),
+        ]));
+        assert!(tree.zoom_to(99));
+        assert_eq!(tree.effective_root_id(), Some(99));
+    }
+
+    // ── with_effective_root_mut ───────────────────────────────────────────
+
+    #[test]
+    fn with_effective_root_mut_receives_real_root_when_not_zoomed() {
+        let mut tree = Tree::new(h_split(vec![tile(1), tile(2)]));
+        let received_id = tree.with_effective_root_mut(|root, _focus| {
+            // The effective root should be the Split.
+            matches!(root, Node::Split { .. })
+        });
+        assert!(received_id, "effective root must be the Split when not zoomed");
+    }
+
+    #[test]
+    fn with_effective_root_mut_receives_zoomed_subtree() {
+        let mut tree = Tree::new(h_split(vec![tile(10), tile(20)]));
+        assert!(tree.zoom_to(10));
+        let got_tile_10 = tree.with_effective_root_mut(|root, _focus| {
+            matches!(root, Node::Tile(10))
+        });
+        assert!(got_tile_10, "effective root must be the zoomed-in Tile(10)");
+    }
+
+    #[test]
+    fn with_effective_root_mut_passes_focus() {
+        let mut tree = Tree::new(h_split(vec![tile(1), tile(2)]));
+        tree.focus_set(2);
+        let focus_seen = tree.with_effective_root_mut(|_root, focus| focus);
+        assert_eq!(focus_seen, Some(2));
+    }
+
+    #[test]
+    fn with_effective_root_mut_return_value_passes_through() {
+        let mut tree = Tree::new(h_split(vec![tile(5), tile(6)]));
+        let result = tree.with_effective_root_mut(|_root, _focus| 42u32);
+        assert_eq!(result, 42u32);
+    }
+
+    #[test]
+    fn with_effective_root_mut_mutation_persists() {
+        let mut tree = Tree::new(Node::Carousel {
+            id: 7,
+            orientation: Orientation::Horizontal,
+            scroll: 0,
+            children: vec![(10, tile(1))],
+        });
+        tree.with_effective_root_mut(|root, _| {
+            if let Node::Carousel { scroll, .. } = root {
+                *scroll = 99;
+            }
+        });
+        if let Some(Node::Carousel { scroll, .. }) = node_by_id(tree.root(), 7) {
+            assert_eq!(*scroll, 99, "mutation inside closure must persist");
+        } else {
+            panic!("carousel not found");
+        }
     }
 }

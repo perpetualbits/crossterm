@@ -658,6 +658,62 @@ fn min_size_along(children: &[(Constraint, Node)], axis: Axis) -> (u16, u16) {
     }
 }
 
+// ── carousel_visible_range ───────────────────────────────────────────────────
+
+/// Read the orientation's current axis without mutating it.
+///
+/// For `Adaptive`, uses the last-resolved axis (defaults to `Horizontal`
+/// before the first solve), matching `peek_axis` in `tree.rs`.
+fn peek_axis_ro(orientation: &Orientation) -> Axis {
+    match orientation {
+        Orientation::Horizontal => Axis::Horizontal,
+        Orientation::Vertical   => Axis::Vertical,
+        Orientation::Adaptive { last, .. } => last.unwrap_or(Axis::Horizontal),
+    }
+}
+
+/// The index range of a carousel's children currently visible in `viewport`.
+///
+/// Includes partially-visible children at either edge.  Returns an empty range
+/// if `carousel` is not a [`Node::Carousel`] or if nothing is visible.
+///
+/// Uses the same `carousel_visible_entries` math as [`solve`] and
+/// `render_carousel`, so the result is guaranteed to match what the renderer
+/// shows — this is the **data-virtualization hook**:
+///
+/// ```rust
+/// # use mullion::{Node, Rect, layout::{carousel_visible_range, solve}};
+/// # fn demo(mut carousel: Node, area: Rect, data: &[String]) {
+/// let range = carousel_visible_range(&carousel, area);
+/// for (i, item) in data[range].iter().enumerate() {
+///     // compute or sample only the visible rows
+/// }
+/// # }
+/// ```
+///
+/// The clamped scroll is computed locally (read-only) — consistent with what a
+/// subsequent `solve` call would produce, even if the stored `scroll` is above
+/// the maximum.
+pub fn carousel_visible_range(carousel: &Node, viewport: Rect) -> std::ops::Range<usize> {
+    let Node::Carousel { orientation, scroll, children, .. } = carousel else {
+        return 0..0;
+    };
+    if children.is_empty() {
+        return 0..0;
+    }
+    let axis = peek_axis_ro(orientation);
+    let main_extent = match axis {
+        Axis::Horizontal => viewport.width,
+        Axis::Vertical => viewport.height,
+    };
+    let extents: Vec<u16> = children.iter().map(|(e, _)| *e).collect();
+    let (_, entries) = carousel_visible_entries(&extents, *scroll, main_extent);
+    match (entries.first(), entries.last()) {
+        (Some(&(first, ..)), Some(&(last, ..))) => first..last + 1,
+        _ => 0..0,
+    }
+}
+
 // ── region_of ────────────────────────────────────────────────────────────────
 
 /// The rect allotted to the node with `id` when `root` is laid out in `area`.
@@ -1519,6 +1575,80 @@ mod tests {
 
         let mut root3 = root.clone();
         assert_eq!(region_of(&mut root3, area, 2), Some(r2));
+    }
+
+    // ── carousel_visible_range ────────────────────────────────────────────
+
+    #[test]
+    fn cvr_matches_solve_visible_indices() {
+        // 10 children × 3 cells each; viewport 10 wide → solve shows indices 0..4
+        // (tile 0→[0,3), 1→[3,6), 2→[6,9), 3→[9,10) partial).
+        let area = Rect::new(0, 0, 10, 5);
+        let node = Node::Carousel {
+            id: 1,
+            orientation: Orientation::Horizontal,
+            scroll: 0,
+            children: (0u64..10).map(|i| (3u16, Node::Tile(i))).collect(),
+        };
+        let rng = carousel_visible_range(&node, area);
+        assert_eq!(rng, 0..4, "should include partial right-edge tile");
+    }
+
+    #[test]
+    fn cvr_shifts_with_scroll() {
+        // scroll=6: tiles 0,1 invisible; tiles 2,3,4 visible; tile 5 partial.
+        let area = Rect::new(0, 0, 10, 5);
+        let node = Node::Carousel {
+            id: 1,
+            orientation: Orientation::Horizontal,
+            scroll: 6,
+            children: (0u64..10).map(|i| (3u16, Node::Tile(i))).collect(),
+        };
+        let rng = carousel_visible_range(&node, area);
+        assert_eq!(rng, 2..6);
+    }
+
+    #[test]
+    fn cvr_out_of_range_scroll_uses_clamped_value() {
+        // total=30, viewport=10, max_scroll=20.  scroll=9999 → clamped to 20.
+        // At scroll=20: tiles 6,7,8,9 visible (same as scroll=20).
+        let area = Rect::new(0, 0, 10, 5);
+        let node = Node::Carousel {
+            id: 1,
+            orientation: Orientation::Horizontal,
+            scroll: 9999,
+            children: (0u64..10).map(|i| (3u16, Node::Tile(i))).collect(),
+        };
+        let rng = carousel_visible_range(&node, area);
+        // clamped scroll=20: tile 6→[0,3), 7→[3,6), 8→[6,9), 9→[9,10) partial
+        assert_eq!(rng, 6..10);
+    }
+
+    #[test]
+    fn cvr_empty_range_for_non_carousel() {
+        let area = Rect::new(0, 0, 80, 24);
+        let node = Node::Tile(42);
+        assert_eq!(carousel_visible_range(&node, area), 0..0);
+        let split = Node::Split {
+            orientation: Orientation::Horizontal,
+            children: vec![(Constraint::new(Size::Fill(1)), Node::Tile(1))],
+        };
+        assert_eq!(carousel_visible_range(&split, area), 0..0);
+    }
+
+    #[test]
+    fn cvr_vertical_carousel() {
+        // 5 rows × 4 cells each; viewport 10 tall; scroll=4.
+        // Tile 0→[-4,0) invisible; tile 1→[0,4); tile 2→[4,8); tile 3→[8,12) partial.
+        let area = Rect::new(0, 0, 20, 10);
+        let node = Node::Carousel {
+            id: 0,
+            orientation: Orientation::Vertical,
+            scroll: 4,
+            children: (0u64..5).map(|i| (4u16, Node::Tile(i))).collect(),
+        };
+        let rng = carousel_visible_range(&node, area);
+        assert_eq!(rng, 1..4);
     }
 
     #[test]

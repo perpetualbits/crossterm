@@ -4,11 +4,10 @@
 > mullion resolves it into one rectangle per tile; you paint into those
 > rectangles. A double-buffered `Terminal` diffs and flushes only what changed.
 >
-> **Status:** Phases 0–7 complete — rendering substrate, layout solver, borders +
+> **Status:** Phases 0–8b complete — rendering substrate, layout solver, borders +
 > junctions, focus, input, smooth virtualized carousels, zoom, border labels,
-> mouse, directional navigation, theming, color downsampling, and degraded-terminal
-> fallback. Apptop integration / the `TileContent` trait (Phase 8) is still ahead
-> and is flagged **(upcoming)** below.
+> mouse, directional navigation, theming, color downsampling, degraded-terminal
+> fallback, dynamic-tree reconcile, and consumer ergonomics helpers.
 
 ---
 
@@ -222,6 +221,28 @@ use mullion::node_id;
 let id = node_id(&node); // Some(id) for Tile or Carousel; None for Split
 ```
 
+**Stable ids from domain keys.** Turn any hashable domain label into a `TileId`
+without an explicit allocation table:
+
+```rust
+use mullion::id_from_key;
+
+// Derive ids from durable domain identity — stable across reconcile cycles.
+let ids: Vec<u64> = vm_ids.iter().map(|&vmid| id_from_key(vmid)).collect();
+
+// ids pair naturally with reconcile_carousel:
+if let Some(carousel) = node_by_id_mut(&mut root, CAROUSEL_ID) {
+    let desired: Vec<(u64, u16)> = vm_ids.iter()
+        .map(|&vmid| (id_from_key(vmid), ROW_HEIGHT))
+        .collect();
+    reconcile_carousel(carousel, &desired);
+}
+```
+
+`id_from_key` is deterministic within a build; equal keys → equal ids every
+call.  Not guaranteed stable across Rust compiler versions — use it for
+frame-to-frame stability, not cross-run persistence.
+
 Address a container (a `Carousel`) or tile by id with `node_by_id` /
 `node_by_id_mut`. Unbounded, runtime-populated collections belong in a `Carousel`
 (§3.6); the fixed skeleton stays a `Split`.
@@ -278,6 +299,24 @@ genuinely cut.
 minimum amount so the focused tile is flush-visible — call it once per frame before
 rendering, with the same rect you render the carousel into.
 
+**Data virtualization.** Use `carousel_visible_range` to restrict data sampling or
+computation to only the rows that will actually be rendered:
+
+```rust
+use mullion::layout::carousel_visible_range;
+
+// carousel_node is a &Node::Carousel; area is the viewport rect.
+let range = carousel_visible_range(&carousel_node, area);
+// sample data only for visible indices — O(visible) not O(total):
+for row in &data[range] {
+    // compute metrics, format text, etc.
+}
+```
+
+The function uses the same internal math as `solve` and `render_carousel`, so the
+range always matches what is on screen (including partially-visible edge tiles).
+An out-of-range stored scroll is clamped the same way `solve` clamps it.
+
 **Composition with the skeleton.** Render the split skeleton with `render_shared`,
 take the carousel's region rect, then `render_carousel` into it. (`examples/
 showcase.rs` demonstrates this.)
@@ -301,6 +340,30 @@ offsets live in the nodes, so both are preserved across zoom automatically. Afte
 structural edit, call `ensure_zoom_valid()` (alongside `ensure_focus_valid()`) to
 pop any zoom level whose target was pruned. apptop's drill-down (host → VM →
 process, Esc to return) *is* this zoom stack.
+
+**Effective-root dispatch.** `effective_root_id()` returns the id when the root is
+a `Tile` or `Carousel`, `None` for a `Split`.  The recommended dispatch pattern
+avoids the typed-enum path (not provided — it adds no expressiveness over a plain
+`match`):
+
+```rust
+// Branch on what the user is currently viewing.
+match tree.effective_root() {
+    Node::Tile(id)            => render_detail_view(*id),
+    Node::Carousel { id, .. } => render_carousel_overview(*id),
+    Node::Split { .. }        => render_split_skeleton(),
+}
+// Or, when only the id matters:
+if let Some(id) = tree.effective_root_id() { /* Tile or Carousel */ }
+```
+
+**Closure accessor.** `with_effective_root_mut` scopes the mutable borrow to the
+tree, so a render closure can disjointly borrow other struct fields without an
+`Option<Tree>` take/restore dance:
+
+```rust
+let rects = tree.with_effective_root_mut(|root, focus| solve(root, area));
+```
 
 ### 3.8 Border labels
 
@@ -408,8 +471,8 @@ Content text passes through unchanged.
 | `backend` | `Backend`, `CrosstermBackend` (`apply_capabilities`, `set_color_depth`, `set_unicode`), `TestBackend` |
 | `terminal` | `Terminal` |
 | `layout` | `solve`, `Node`, `Constraint`, `Size`, `Orientation`, `Axis` |
-| `tree` | `Tree`, `Dir`, `Direction`, `tile_id_of`, `node_id`, `leaves`, `focus_path`, `focus_override`, `node_by_id`/`node_by_id_mut`, `reconcile_carousel`, `reconcile_split` |
-| `layout` (module) | `solve`, `region_of`, `min_size` |
+| `tree` | `Tree`, `Dir`, `Direction`, `tile_id_of`, `node_id`, `id_from_key`, `leaves`, `focus_path`, `focus_override`, `node_by_id`/`node_by_id_mut`, `reconcile_carousel`, `reconcile_split` |
+| `layout` (module) | `solve`, `region_of`, `carousel_visible_range`, `min_size` |
 | `render` | `render_carousel` |
 | `border` | `draw_box`, `frame_tiles`, `render_shared`, `BorderStyle`, `Borders`, `LineWeight`, `CornerStyle` |
 | `junction` | `EdgeGrid`, `EdgeCell`, `resolve` |
@@ -421,13 +484,15 @@ Content text passes through unchanged.
 `focus_last`/`ensure_focus_valid`, `focus_dir`/`focus_dir_cross`,
 `flip_focused_parent`/`swap_focused`, `scroll_by`/`scroll_to`/
 `scroll_focus_into_view`, `zoom_to`/`zoom_focus`/`zoom_out`/`zoom_reset`/
-`is_zoomed`/`zoom_depth`/`ensure_zoom_valid`, `effective_root`/`effective_root_mut`.
+`is_zoomed`/`zoom_depth`/`ensure_zoom_valid`, `effective_root`/`effective_root_mut`/
+`effective_root_id`/`with_effective_root_mut`.
 
 Common re-exports at the crate root: `Buffer`, `Cell`, `Node`, `Constraint`,
 `Size`, `Orientation`, `LineWeight`, `Theme`, `Capabilities`, `box_to_ascii`,
-`Color`, `ColorDepth`, `Style`, `node_id`, `reconcile_carousel`,
-`reconcile_split`, `region_of`.  Module-scoped: `Axis`, `region_of`, `solve`
-(`layout`); `Dir`/`Direction` (`tree`).
+`Color`, `ColorDepth`, `Style`, `node_id`, `id_from_key`, `reconcile_carousel`,
+`reconcile_split`, `region_of`, `carousel_visible_range`.  Module-scoped:
+`Axis`, `region_of`, `carousel_visible_range`, `solve` (`layout`);
+`Dir`/`Direction` (`tree`).
 
 ---
 
@@ -469,8 +534,9 @@ cargo run --example showcase
 | 7c    | `Theme` (named style roles), `ColorDepth`, `Color::downsample` |
 | 7d    | `Capabilities::detect`, `box_to_ascii`, `apply_capabilities`, quickstart example |
 | 8a    | `node_id`, `reconcile_carousel`, `reconcile_split`, `region_of`; §3.5 manual |
+| 8b    | `carousel_visible_range`, `with_effective_root_mut`, `id_from_key`, `effective_root_id`; §3.5–3.7 manual |
 
-**Upcoming:** Phase 8b — apptop integration.
+**Upcoming:** Phase 8c — apptop integration.
 
 See `docs/tiling-engine-roadmap.md` for the full plan and open design questions.
 This manual tracks the public API as each phase merges.
