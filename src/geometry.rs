@@ -62,6 +62,82 @@ impl Rect {
         x >= self.x && x < self.right() && y >= self.y && y < self.bottom()
     }
 
+    /// Return the number of cells on the border perimeter.
+    ///
+    /// The border visits every cell on the outer ring of the rectangle exactly
+    /// once, clockwise from the top-left corner.  For a rectangle with `width`
+    /// W and `height` H, the count is `2*(W+H) - 4`; the four corner cells
+    /// are shared between two edges but counted only once in the clockwise
+    /// walk.
+    ///
+    /// Returns `self.area()` for rectangles smaller than 2×2 (where there is
+    /// no distinct interior to distinguish from the border).
+    pub fn border_len(self) -> u32 {
+        if self.width < 2 || self.height < 2 {
+            return self.area();
+        }
+        2 * (u32::from(self.width) + u32::from(self.height)) - 4
+    }
+
+    /// Return the normalised position `s ∈ [0, 1)` of cell `(x, y)` on the
+    /// clockwise border perimeter, starting from the top-left corner.
+    ///
+    /// The walk order is:
+    /// - **Top edge** (`y == self.y`): left → right, s = 0 … W/(2W+2H-4).
+    /// - **Right edge** (`x == self.right()-1`): top → bottom.
+    /// - **Bottom edge** (`y == self.bottom()-1`): right → left.
+    /// - **Left edge** (`x == self.x`): bottom → top.
+    ///
+    /// Each corner belongs to the edge that first reaches it in the clockwise
+    /// walk (so the top-left corner is at `s = 0`, top-right is on the top
+    /// edge, bottom-right is on the right edge, and bottom-left is on the
+    /// bottom edge).  Interior cells, and cells outside the rectangle, return
+    /// `0.0` (same as the top-left corner — callers that need to distinguish
+    /// them should check [`Rect::contains`] first).
+    ///
+    /// # Use case
+    ///
+    /// Feed the result into [`ease::gaussian`](crate::ease::gaussian) or a
+    /// sinusoid to animate a smooth, wrap-around effect on a box border — for
+    /// example a colour bump that travels continuously around the rectangle
+    /// without a visible seam at the starting corner.
+    ///
+    /// ```
+    /// use mullion::Rect;
+    ///
+    /// let r = Rect::new(0, 0, 5, 4); // 5 wide, 4 tall; border_len = 14
+    /// assert_eq!(r.border_pos(0, 0), 0.0 / 14.0);  // top-left  (top edge, s=0)
+    /// assert_eq!(r.border_pos(4, 0), 4.0 / 14.0);  // top-right (top edge, s=4)
+    /// assert_eq!(r.border_pos(4, 3), 7.0 / 14.0);  // bot-right (right edge, s=4+3=7)
+    /// assert_eq!(r.border_pos(0, 3), 11.0 / 14.0); // bot-left  (bottom edge, s=4+3+4=11)
+    /// ```
+    pub fn border_pos(self, x: u16, y: u16) -> f32 {
+        if self.width < 2 || self.height < 2 {
+            return 0.0;
+        }
+        let bx0 = self.x;
+        let by0 = self.y;
+        let bx1 = self.x + self.width - 1;
+        let by1 = self.y + self.height - 1;
+        let w = u32::from(self.width - 1);
+        let h = u32::from(self.height - 1);
+        let perim = (2 * (w + h)) as f32;
+
+        let s: u32 = if y == by0 {
+            u32::from(x.saturating_sub(bx0))          // top →
+        } else if x == bx1 {
+            w + u32::from(y.saturating_sub(by0))      // right ↓
+        } else if y == by1 {
+            w + h + u32::from(bx1.saturating_sub(x)) // bottom ←
+        } else if x == bx0 {
+            2 * w + h + u32::from(by1.saturating_sub(y)) // left ↑
+        } else {
+            return 0.0; // interior or outside
+        };
+
+        s as f32 / perim
+    }
+
     /// Return the largest `Rect` that fits within both `self` and `other`.
     ///
     /// Computes the overlap by taking the maximum of the two left/top edges and

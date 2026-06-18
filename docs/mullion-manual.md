@@ -458,12 +458,89 @@ Content text passes through unchanged.
 
 ---
 
+### 3.11 Animation helpers
+
+The `ease` module and a pair of geometry methods on `Rect` cover the recurring
+needs of animated TUI code without tying mullion to an animation runtime.
+
+#### `mullion::ease`
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `smoothstep` | `(t: f32) -> f32` | 3t²−2t³ easing, clamped to [0,1]. Zero slope at both ends — smooth start and stop. |
+| `lerp` | `(a, b, t: f32) -> f32` | Linear interpolation; extrapolates when `t` is outside [0,1]. |
+| `gaussian` | `(x, sigma: f32) -> f32` | Normalised Gaussian kernel exp(−x²/2σ²), peaking at 1.0 when x=0. |
+
+All three are also re-exported at the crate root (`mullion::smoothstep`, etc.).
+
+**Animated zoom pattern** — the most common use of `smoothstep` is easing a
+`Fill` weight to grow one tile smoothly without `Tree::zoom_to` (which is
+discrete).  Keep a `t: f32` in `[0, 1]` and update the weight every frame:
+
+```rust
+use mullion::{ease::smoothstep, layout::{Constraint, Size}};
+
+// Advance t toward 1 when zooming in, toward 0 when zooming out:
+// t += dt / 0.3;  // 300 ms ease
+let weight = (1.0 + smoothstep(t) * 399.0) as u16; // 1 → 400
+// Pass weight as Size::Fill(weight) to the focused tile's Constraint.
+```
+
+The layout solver then grows that tile continuously each frame — no jump.
+
+#### `Rect::border_pos` and `Rect::border_len`
+
+```rust
+let r = Rect::new(x, y, w, h);
+let s: f32 = r.border_pos(cx, cy); // 0.0 .. <1.0, clockwise from top-left
+let p: u32 = r.border_len();        // total border cells = 2*(w+h)-4
+```
+
+`border_pos` maps a cell coordinate to its normalised position on the closed
+clockwise perimeter of the rectangle (top edge → right edge → bottom edge →
+left edge, each corner counted once).  Interior cells and cells outside the
+rect return 0.0.
+
+The primary use case is animating box borders.  Combine with `ease::gaussian`
+to apply a colour bump that travels around the entire rectangle without any
+visible seam:
+
+```no_run
+use mullion::{Color, Rect, ease::gaussian};
+
+fn border_color(rect: Rect, x: u16, y: u16, t: f32) -> Color {
+    let s     = rect.border_pos(x, y);
+    let center = (0.15_f32 + t * 0.09).rem_euclid(1.0); // CW rotation
+    let diff  = (s - center + 0.5).rem_euclid(1.0) - 0.5; // shortest arc
+    let bump  = gaussian(diff, 0.07);                       // 0..1
+    Color::from_hsv(200.0 + bump * 40.0, 0.85, 0.5 + bump * 0.4)
+}
+```
+
+Because `border_pos` walks the full perimeter as one loop, the bump passes
+through corners and between edges with no discontinuity — the color is purely
+a function of position on the loop and never has to know which edge it is on.
+
+#### `Color::from_hsv`
+
+```rust
+Color::from_hsv(hue_degrees, saturation, value) -> Color::Rgb(r, g, b)
+```
+
+HSV → 24-bit RGB conversion.  `h` wraps automatically; `s` and `v` clamp to
+[0, 1].  This is the most natural space for hue-cycling animations: hold `s`
+near 1 for vivid colours and modulate `h` or `v` to produce palette shifts and
+brightness pulses.
+
+---
+
 ## 4. API reference by module
 
 | Module | Key items |
 |--------|-----------|
-| `geometry` | `Rect` (`intersection`, `contains`, `right`, `bottom`, `area`) |
-| `style` | `Style`, `Color`, `ColorDepth`, `Modifier` |
+| `geometry` | `Rect` (`intersection`, `contains`, `right`, `bottom`, `area`, `border_pos`, `border_len`) |
+| `style` | `Style`, `Color` (`from_hsv`, `downsample`), `ColorDepth`, `Modifier` |
+| `ease` | `smoothstep`, `lerp`, `gaussian` |
 | `theme` | `Theme` (`default`, `light`, `border_style`) |
 | `capabilities` | `Capabilities` (`detect`, `full`, `from_env`) |
 | `charset` | `box_to_ascii` |
@@ -735,11 +812,29 @@ cargo run --example showcase
 
 `showcase.rs` is the reference for the `render_carousel` ↔ `render_shared` composition.
 
+**`examples/spiral_stress.rs`** (in the `aerie` crate) — an animated stress test
+and visual demo.  Draws a stack of nested frames arranged like a Fibonacci /
+golden-rectangle spiral that continuously uncurls and re-curls the other way
+(Electric Sheep style).  Each border is a closed perimeter loop with three
+Gaussian color bumps travelling around it at different speeds and directions.
+The gaps in each border carry streaming ◻ bands with independent per-band colors.
+Swarm mode tiles the screen with many spirals via `layout::solve`; animated zoom
+eases a `Fill` weight to grow one tile to fill the screen and back.
+
+The example exercises `ease::smoothstep` (animated zoom), `ease::gaussian`
+(border color bumps), `Rect::border_pos` (perimeter loop geometry), and
+`Color::from_hsv` (hue-shift palette) — all the §3.11 animation helpers.
+
+```text
+cargo run --release --example spiral_stress        # single spiral
+cargo run --release --example spiral_stress --swarm  # swarm + zoom
+```
+
 ---
 
 ## 7. Status & roadmap
 
-**Complete (Phases 0–7):**
+**Complete:**
 
 | Phase | What landed |
 |-------|-------------|
@@ -754,8 +849,9 @@ cargo run --example showcase
 | 7d    | `Capabilities::detect`, `box_to_ascii`, `apply_capabilities`, quickstart example |
 | 8a    | `node_id`, `reconcile_carousel`, `reconcile_split`, `region_of`; §3.5 manual |
 | 8b    | `carousel_visible_range`, `with_effective_root_mut`, `id_from_key`, `effective_root_id`; §3.5–3.7 manual |
+| 8c    | Animation helpers: `ease` module (`smoothstep`, `lerp`, `gaussian`), `Rect::border_pos`/`border_len`, `Color::from_hsv`; §3.11 manual |
 
-**Upcoming:** Phase 8c — apptop integration.
+**Upcoming:** Phase 9 — aerie integration.
 
 See `docs/tiling-engine-roadmap.md` for the full plan and open design questions.
 This manual tracks the public API as each phase merges.

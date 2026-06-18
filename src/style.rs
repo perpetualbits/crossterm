@@ -255,6 +255,47 @@ fn nearest_ansi16(r: u8, g: u8, b: u8) -> Color {
 }
 
 impl Color {
+    /// Construct a 24-bit [`Color::Rgb`] from hue, saturation, and value.
+    ///
+    /// - `h` — hue in degrees, wrapped automatically to `[0°, 360°)`.
+    /// - `s` — saturation, clamped to `[0, 1]`.  `0` gives a grey.
+    /// - `v` — value (brightness), clamped to `[0, 1]`.  `0` gives black.
+    ///
+    /// This is the standard HSV → RGB conversion (identical to "HSB" in most
+    /// colour pickers).  It is the most natural space for hue-shifting colour
+    /// animations: increment `h` to cycle through the spectrum, hold `s` near
+    /// 1 for vivid colours, and modulate `v` for pulsing brightness.
+    ///
+    /// ```
+    /// use mullion::Color;
+    /// assert_eq!(Color::from_hsv(0.0,   1.0, 1.0), Color::Rgb(255,   0,   0)); // red
+    /// assert_eq!(Color::from_hsv(120.0, 1.0, 1.0), Color::Rgb(  0, 255,   0)); // green
+    /// assert_eq!(Color::from_hsv(240.0, 1.0, 1.0), Color::Rgb(  0,   0, 255)); // blue
+    /// assert_eq!(Color::from_hsv(0.0,   0.0, 1.0), Color::Rgb(255, 255, 255)); // white (s=0)
+    /// assert_eq!(Color::from_hsv(0.0,   1.0, 0.0), Color::Rgb(  0,   0,   0)); // black (v=0)
+    /// ```
+    pub fn from_hsv(h: f32, s: f32, v: f32) -> Color {
+        let s = s.clamp(0.0, 1.0);
+        let v = v.clamp(0.0, 1.0);
+        let h = h.rem_euclid(360.0);
+        let c = v * s;
+        let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+        let m = v - c;
+        let (r, g, b) = match (h / 60.0) as u32 {
+            0 => (c, x, 0.0_f32),
+            1 => (x, c, 0.0),
+            2 => (0.0, c, x),
+            3 => (0.0, x, c),
+            4 => (x, 0.0, c),
+            _ => (c, 0.0, x),
+        };
+        Color::Rgb(
+            ((r + m) * 255.0).round() as u8,
+            ((g + m) * 255.0).round() as u8,
+            ((b + m) * 255.0).round() as u8,
+        )
+    }
+
     /// Map this colour down to `depth`.
     ///
     /// | Variant        | TrueColor | Palette256                      | Palette16                  |
