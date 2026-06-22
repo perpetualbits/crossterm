@@ -46,6 +46,10 @@ path = "examples/runaround.rs"
 name = "runaround_multi"
 path = "examples/runaround_multi.rs"
 
+[[example]]
+name = "sockets"
+path = "examples/sockets.rs"
+
 [dependencies]
 bitflags = "2"
 crossterm = "0.28"
