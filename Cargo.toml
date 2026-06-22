@@ -38,6 +38,10 @@ path = "examples/records.rs"
 name = "document"
 path = "examples/document.rs"
 
+[[example]]
+name = "runaround"
+path = "examples/runaround.rs"
+
 [dependencies]
 bitflags = "2"
 crossterm = "0.28"
