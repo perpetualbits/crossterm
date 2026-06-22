@@ -352,7 +352,9 @@ fn fill_lines(graphemes: &[Grapheme], flags: &BreakFlags, width: u16) -> Vec<Ran
     // Flat wrapping is the obstacle-free special case of the slot stream: an
     // unbounded run of equal-width slots. The same per-line kernel serves both.
     while start < n {
-        let end = fill_one_line(graphemes, flags, start, target);
+        // maxw == target: every line is the same width, so a word never "moves on"
+        // — fill_one_line hard-breaks an over-wide word exactly as a plain wrap.
+        let end = fill_one_line(graphemes, flags, start, target, target);
         if end == start {
             // Oversized lone grapheme (width < 2 regime): emit it by itself so the
             // walk makes progress; this is the one case a line may exceed `width`.
@@ -369,16 +371,34 @@ fn fill_lines(graphemes: &[Grapheme], flags: &BreakFlags, width: u16) -> Vec<Ran
 /// Greedily fill one line/slot, returning the grapheme index where it ends.
 ///
 /// Walks forward from `start`, accumulating widths, until the next visible
-/// grapheme would overflow `target` (wrap at the last allowed break, or hard-break
-/// here if none), or a hard newline forces the line to end, or the text runs out.
-/// Breakable spaces hang past the edge rather than forcing a wrap (the caller
-/// trims them). The returned range is **not** trimmed.
+/// grapheme would overflow `target`, or a hard newline forces the line to end, or
+/// the text runs out. Breakable spaces hang past the edge rather than forcing a
+/// wrap (the caller trims them). The returned range is **not** trimmed.
+///
+/// On overflow with whole words already placed, it wraps at the last allowed
+/// break. Overflow *mid-first-word* (no break opportunity yet) is the interesting
+/// case: the word does not fit this slot, so it is **kept whole and moved on** —
+/// the function returns `start` (an empty result) so the caller can retry it in a
+/// wider slot. It hard-breaks the word only when `target >= maxw`, i.e. this slot
+/// is already as wide as any available, so no wider slot exists to move it to.
+///
+/// # Parameters
+/// - `target`: the width to fill.
+/// - `maxw`: the widest target among all slots the caller will offer. For flat
+///   wrapping every line has the same width, so `maxw == target` and the
+///   move-on case never triggers — behavior is identical to a plain greedy wrap.
 ///
 /// # Returns
-/// The exclusive end grapheme index. `end == start` means not even the first
-/// visible grapheme fits `target` — the caller decides whether to emit it anyway
-/// (flat wrap) or skip to a wider slot (runaround).
-fn fill_one_line(graphemes: &[Grapheme], flags: &BreakFlags, start: usize, target: u32) -> usize {
+/// The exclusive end grapheme index. `end == start` means nothing was placed:
+/// either the first grapheme is wider than `target`, or the first word does not
+/// fit and a wider slot exists for it.
+fn fill_one_line(
+    graphemes: &[Grapheme],
+    flags: &BreakFlags,
+    start: usize,
+    target: u32,
+    maxw: u32,
+) -> usize {
     let n = graphemes.len();
     let mut i = start;
     let mut acc = 0u32; // accumulated width of [start, i), trailing spaces included
@@ -394,10 +414,14 @@ fn fill_one_line(graphemes: &[Grapheme], flags: &BreakFlags, start: usize, targe
         // Spaces hang past the edge; only a visible grapheme that overflows wraps.
         if w > 0 && acc + w > target && !g.is_space {
             return if i > start {
-                // Wrap at the remembered break, or hard-break at `i` if none.
                 match last_break {
+                    // Whole words fit before this one: wrap at the word boundary.
                     Some(b) if b > start => b,
-                    _ => i,
+                    // Mid-first-word overflow: keep the word whole and move it to a
+                    // wider slot (return `start`), unless this slot is already the
+                    // widest available, in which case hard-break it here.
+                    _ if target >= maxw => i,
+                    _ => start,
                 }
             } else {
                 start // first visible grapheme too wide for `target`
@@ -421,23 +445,29 @@ fn fill_one_line(graphemes: &[Grapheme], flags: &BreakFlags, start: usize, targe
 /// [`fill_one_line`] kernel — so the obstacle-free case (one full-width slot per
 /// row) reduces to flat wrapping exactly.
 ///
-/// A slot too narrow for the next grapheme is left **empty** (an empty range) and
-/// the grapheme is retried on the following, possibly wider, slot — so no glyph is
-/// ever placed in a slot it does not fit. Text that outlasts the slots is dropped
-/// (it falls below the viewport). Ranges are trimmed of trailing spaces.
+/// **Words are kept whole**: a slot too narrow for the next word is left **empty**
+/// and the word is retried on a following, wider slot (so no glyph is placed where
+/// it does not fit, and no word is split mid-letter just because a gap between
+/// tiles is small). A word is hard-broken only when it is wider than *every* slot
+/// (`maxw` below), which also guarantees the fill always makes progress. Text that
+/// outlasts the slots is dropped (it falls below the viewport). Ranges are trimmed
+/// of trailing spaces.
 fn fill_slots(graphemes: &[Grapheme], flags: &BreakFlags, widths: &[u16]) -> Vec<Range<usize>> {
     let n = graphemes.len();
     let mut out = Vec::with_capacity(widths.len());
     let mut start = 0usize;
+    // The widest slot: a word wider than this fits nowhere whole, so it may be
+    // hard-broken; any narrower word is moved on until a slot fits it.
+    let maxw = widths.iter().copied().max().unwrap_or(0) as u32;
 
     for &w in widths {
         if start >= n {
             out.push(start..start); // text exhausted — remaining slots are empty
             continue;
         }
-        let end = fill_one_line(graphemes, flags, start, w as u32);
+        let end = fill_one_line(graphemes, flags, start, w as u32, maxw);
         if end == start {
-            // Too narrow for the next grapheme: leave empty, retry on a later slot.
+            // This slot held no whole word: leave it empty, retry on a later slot.
             out.push(start..start);
         } else {
             out.push(trim_trailing_spaces(graphemes, start..end));
@@ -781,14 +811,24 @@ mod tests {
 
     #[test]
     fn wrap_into_slots_flows_across_varying_widths() {
-        // Slots of width 5, 3, 8: greedy fill flows across the sequence.
+        // Slots of width 5, 3, 8: words are kept whole and flow across the slots.
         let lines = wrap_into_slots("alpha beta gamma", &[5, 3, 8], BaseDirection::Ltr);
         assert_eq!(lines.len(), 3); // one line per slot
         assert_eq!(visual_string(&lines[0]), "alpha");
-        // The width-3 slot is too narrow for "beta", so it hard-breaks like any
-        // narrow column would — "bet" here, the rest carrying into the next slot.
-        assert_eq!(visual_string(&lines[1]), "bet");
-        assert_eq!(visual_string(&lines[2]), "a gamma");
+        // "beta" (4) does not fit the width-3 slot, so rather than hard-break it,
+        // the slot is left empty and the whole word moves into the next slot.
+        assert_eq!(visual_string(&lines[1]), "");
+        assert_eq!(visual_string(&lines[2]), "beta"); // "gamma" overflows the slots
+    }
+
+    #[test]
+    fn wrap_into_slots_hard_breaks_only_when_wider_than_every_slot() {
+        // No slot can hold "abcdefgh" (8) whole — the widest is 3 — so it must
+        // hard-break across the slots rather than vanish.
+        let lines = wrap_into_slots("abcdefgh", &[3, 3, 3], BaseDirection::Ltr);
+        assert_eq!(visual_string(&lines[0]), "abc");
+        assert_eq!(visual_string(&lines[1]), "def");
+        assert_eq!(visual_string(&lines[2]), "gh");
     }
 
     #[test]
