@@ -1232,6 +1232,16 @@ slot-order flip.
 cargo run --example runaround
 ```
 
+**`examples/runaround_multi.rs`** — runaround (§3.19) around **three** tiles at
+once, with a paragraph mixing LTR English and RTL Arabic. `Tab` selects a tile,
+`hjkl`/arrows move it (all rows reflow), `[`/`]` change the gutter, `d` flips
+LTR ↔ RTL. Exercises both the per-screen terminal-bidi handling (§3.16) and the
+words-kept-whole flow (§3.19).
+
+```text
+cargo run --example runaround_multi
+```
+
 **`examples/spiral_stress.rs`** (in the `aerie` crate) — an animated stress test
 and visual demo.  Draws a stack of nested frames arranged like a Fibonacci /
 golden-rectangle spiral that continuously uncurls and re-curls the other way

@@ -2,7 +2,8 @@
 // Copyright (C) 2026  Epsilon Null Operation
 //! The text engine core: bidi-aware paragraph wrapping with a logical↔visual
 //! cursor map, plus pagination and scrolling as views over one model
-//! (design note §3, excluding runaround which is Phase 5).
+//! (design note §3). The geometry-free slot-flow core that [`crate::runaround`]
+//! builds on ([`wrap_into_slots`]) also lives here.
 //!
 //! ## Pipeline (per paragraph → per visual line)
 //!
@@ -617,9 +618,12 @@ pub fn wrap(text: &str, width: u16, base: BaseDirection) -> WrappedText {
 /// the slots is dropped. Callers (see [`crate::runaround`]) attach each line's
 /// row/column from the slot geometry.
 ///
-/// Because this routes through the same kernel as [`wrap`], a single full-width
-/// slot per row reproduces flat wrapping exactly. No glyph is ever placed in a
-/// slot narrower than it.
+/// **Words are kept whole.** A word that does not fit the current slot is moved on
+/// to a later, wider slot rather than split mid-letter (leaving the narrow slot
+/// empty); a word is hard-broken across slots only when it is wider than *every*
+/// slot, so it fits nowhere whole. Because this routes through the same kernel as
+/// [`wrap`], a single full-width slot per row — where every slot is the widest, so
+/// no word can move on — reproduces flat wrapping exactly.
 pub fn wrap_into_slots(text: &str, widths: &[u16], base: BaseDirection) -> Vec<VisualLine> {
     let graphemes = segment(text);
     let info = BidiInfo::new(text, base.to_level());

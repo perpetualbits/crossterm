@@ -3,11 +3,12 @@
 //! The seek-shaped data-provider trait for row virtualization (design note §4.1).
 //!
 //! This module defines the *contract* a backing store must satisfy to be scrolled
-//! through without materializing all of its rows.  It is defined **here, with the
-//! floating-tile foundation**, rather than retrofitted alongside the consumer
-//! (Phase 3), so the rest of the engine can be built against a stable shape from
-//! the start.  No implementations live here yet — only the trait, the [`Window`]
-//! it returns, and the reasoning that fixes the shape.
+//! through without materializing all of its rows.  The trait and its [`Window`]
+//! type were defined **with the floating-tile foundation**, rather than
+//! retrofitted alongside the consumer, so the rest of the engine could be built
+//! against a stable shape from the start.  It also ships [`VecRecordSource`], an
+//! in-memory reference implementation for tests and demos; real seek/keyset and
+//! LDAP VLV implementations live in the consuming applications.
 //!
 //! ## Why seek, not offset
 //!
