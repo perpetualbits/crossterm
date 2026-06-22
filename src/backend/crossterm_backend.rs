@@ -169,11 +169,13 @@ impl<W: Write> CrosstermBackend<W> {
 
     /// Write the escape sequences that restore the terminal to its normal state.
     ///
-    /// Emits (in order): `DisableMouseCapture` (if mouse_enabled), `LeaveAlternateScreen`,
-    /// `Show` (show cursor).  Deliberately does **not** call `disable_raw_mode`,
-    /// which is a tty syscall and therefore unavailable in tests using a `Vec<u8>`
-    /// sink.  [`leave`](Backend::leave) calls `write_restore` and then
-    /// `disable_raw_mode`.
+    /// Emits (in order): `BDSM_IMPLICIT` (restore bidi on the alternate screen),
+    /// `DisableMouseCapture` (if mouse_enabled), `LeaveAlternateScreen`, `Show`
+    /// (show cursor), then `BDSM_IMPLICIT` again (restore bidi on the primary
+    /// screen — both were set explicit in `enter`).  Deliberately does **not** call
+    /// `disable_raw_mode`, which is a tty syscall and therefore unavailable in
+    /// tests using a `Vec<u8>` sink.  [`leave`](Backend::leave) calls
+    /// `write_restore` and then `disable_raw_mode`.
     fn write_restore(&mut self) -> io::Result<()> {
         // Restore implicit BiDi on the alternate screen, leave it, then restore it
         // on the primary screen too — both were set explicit in `enter`, so the
@@ -373,10 +375,12 @@ impl<W: Write> Backend for CrosstermBackend<W> {
     /// Steps (in order):
     /// 1. Enable raw mode so keystrokes are delivered immediately without
     ///    line-editing or echoing.
-    /// 2. Enter the alternate screen buffer so the normal shell output is
-    ///    preserved and restored on exit, then switch the terminal to BDSM
-    ///    *explicit* mode so it does not re-apply BiDi to mullion's already
-    ///    visual-ordered cells (see [`BDSM_EXPLICIT`]).
+    /// 2. Switch the terminal to BDSM *explicit* mode so it does not re-apply BiDi
+    ///    to mullion's already visual-ordered cells, enter the alternate screen
+    ///    buffer (so the normal shell output is preserved and restored on exit),
+    ///    then set BDSM explicit *again* — VTE tracks the mode per screen buffer,
+    ///    so it is set on both the primary and the alternate screen (see
+    ///    [`BDSM_EXPLICIT`]).
     /// 3. Hide the cursor to prevent it from flickering over the UI.
     /// 4. Enable mouse capture (if [`mouse_enabled`](CrosstermBackend::set_mouse_capture)
     ///    is `true`) so click and scroll events are delivered.
@@ -387,9 +391,9 @@ impl<W: Write> Backend for CrosstermBackend<W> {
     ///    when the default panic handler writes to stderr.
     ///
     /// # Errors
-    /// Returns an error if raw mode cannot be enabled (e.g. if `stdout` is not
-    /// a tty).  In that case neither the alternate screen nor the panic hook is
-    /// installed.
+    /// Returns an error if raw mode cannot be enabled (e.g. if `stdout` is not a
+    /// tty), or if writing the setup escape sequences to the writer fails.  If raw
+    /// mode fails, neither the alternate screen nor the panic hook is installed.
     fn enter(&mut self) -> io::Result<()> {
         enable_raw_mode()?;
         // Tell bidi-aware terminals (VTE: gnome-terminal, terminator, …) not to
