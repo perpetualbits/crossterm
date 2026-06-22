@@ -26,9 +26,15 @@ path = "examples/showcase.rs"
 name = "floating"
 path = "examples/floating.rs"
 
+[[example]]
+name = "text"
+path = "examples/text.rs"
+
 [dependencies]
 bitflags = "2"
 crossterm = "0.28"
+unicode-bidi = "0.3"
+unicode-linebreak = "0.1"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 
