@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026  Epsilon Null Operation
-//! Phase 8 demo — orthogonal connector routing (design note §5.2).
+//! Phase 9 demo — connector routing with nudging + colour-per-net (§5.2/§5.3).
 //!
 //! Three nodes, each with an input socket (left) and an output socket (right),
-//! wired in a triangle. The connectors are routed with grid A\* over the free
-//! cells around the nodes, with a bend penalty so they prefer long straight runs
-//! ("train tracks"). Drag a node and the wires **reroute live** around it.
+//! wired in a triangle. The connectors are routed *together* with grid A\* over
+//! the free cells (bend penalty for long straight "train track" runs): parallel
+//! wires nudge onto separate tracks, crossings are biased away, and each net gets
+//! its own colour so a `┼` crossing reads by following the hue. Drag a node and
+//! the coloured wires **reroute and re-nudge live** around it.
 //!
 //! Routing is in canvas space and recomputed each frame (cheap at this scale).
-//! No connectors cross-disambiguation yet — a crossing reads as a `┼` join
-//! (Phase 9 adds color-per-net).
 //!
 //! Keys
 //!   Tab                  select the next node
@@ -29,13 +29,16 @@ use mullion::{
     label::Side,
     mouse::tile_at,
     poll_event,
-    route::{render as render_connectors, Connector},
+    route::{render as render_connectors, route_all, Connector, RouteRequest},
     socket::{draw_socket, Flow, Socket},
     style::{Color, Modifier, Style},
     Buffer, FloatRect, GraphCanvas, LineWeight, Rect, Terminal, TileId,
 };
 
 const BEND: u32 = 4; // bend penalty: higher = straighter
+const CROSS: u32 = 8; // crossing penalty: bias toward crossing-free routes
+/// One colour per net, so crossings read by colour (no hop-over glyph exists).
+const NET_COLORS: [Color; 4] = [Color::Cyan, Color::Magenta, Color::Yellow, Color::Green];
 
 struct State {
     canvas: GraphCanvas,
@@ -89,24 +92,28 @@ fn render(buf: &mut Buffer, st: &mut State) {
     let free: HashSet<(u16, u16)> =
         free_cells_in_window(canvas_rect, &obstacles, 0, canvas_rect).into_iter().collect();
 
-    // Route every wire fresh this frame.
+    // Build a routing request per wire, then route them all together so parallel
+    // wires nudge onto separate tracks and crossings are biased away.
     let rect_of = |id: TileId| node_rects.iter().find(|&&(i, _)| i == id).map(|&(_, r)| r);
-    let mut connectors: Vec<Connector> = Vec::new();
-    for &(a, b) in &st.wires {
+    let mut reqs: Vec<RouteRequest> = Vec::new();
+    let mut colors: Vec<Color> = Vec::new();
+    for (i, &(a, b)) in st.wires.iter().enumerate() {
         let (Some(ra), Some(rb)) = (rect_of(a), rect_of(b)) else { continue };
-        let src = out_socket(ra.height);
-        let dst = in_socket(rb.height);
+        let (src, dst) = (out_socket(ra.height), in_socket(rb.height));
         let (Some(start), Some(goal)) = (src.attach(ra), dst.attach(rb)) else { continue };
-        if let Some(c) = Connector::route(&free, start, goal, BEND,
-            src.outward().opposite(), dst.outward().opposite())
-        {
-            connectors.push(c);
-        }
+        reqs.push(RouteRequest::new(start, goal, src.outward().opposite(), dst.outward().opposite()));
+        colors.push(NET_COLORS[i % NET_COLORS.len()]);
     }
+    // Keep the nets that routed, paired with their colour.
+    let (connectors, styles): (Vec<Connector>, Vec<Style>) = route_all(&free, &reqs, BEND, CROSS)
+        .into_iter()
+        .zip(&colors)
+        .filter_map(|(c, &col)| c.map(|c| (c, Style::default().fg(col))))
+        .unzip();
 
     // Connectors first (under the nodes), then nodes on top.
-    render_connectors(buf, canvas_rect, (window.x, window.y), &connectors, &obstacles,
-        LineWeight::Light, Style::default().fg(Color::Green));
+    render_connectors(buf, canvas_rect, (window.x, window.y), &connectors, &styles,
+        &obstacles, LineWeight::Light);
 
     for (id, crect) in &node_rects {
         // Map the canvas rect to screen.
