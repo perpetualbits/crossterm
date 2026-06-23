@@ -1243,9 +1243,12 @@ terms (crossings, length, area, alignment, bends, edge-over-node) and keeps the 
 `overlap` penalty. A handful of corrections is enough
 to recover a taste — two users taught with opposite labels on the same layouts learn
 opposite weights and make opposite crossings-vs-length tradeoffs. A learnable layout
-engine with no neural net, on this deterministic scaffolding. Demo: `cargo run
---example autolayout` (`a` lays out, `r` refines, `w` cycles the default and two
-*learned* tastes — watch the same graph settle differently).
+engine with no neural net, on this deterministic scaffolding. Demos: `cargo run
+--example autolayout` (`a` lays out, `r`/`n` refine/anneal, `w` cycles the default
+and two *learned* tastes), and `cargo run --example teach` — **drag nodes to improve
+a layout, press `t` to teach** the engine your real correction, `a` to re-lay-out
+under your learned taste. (A term that never varies across your corrections — e.g. no
+edge ever crosses a node — carries no signal and keeps a small bounded weight.)
 
 ---
 
@@ -1672,6 +1675,18 @@ colour layer (`c` toggles colour).
 cargo run --example video
 ```
 
+**`examples/teach.rs`** — the §3.27 learnable layout, interactive: the engine lays a
+small graph out (sockets + orthogonal colour-per-net wires), you **drag nodes** to
+improve it, `t` teaches the engine that correction (re-fitting the weights), and `a`
+re-lays-out under your learned taste. The header shows the learned **emphasis** (each
+term's share) shifting as you teach. Corrections are **saved to disk and reloaded on
+startup** (`~/.mullion-teach-lessons.txt`), so the taste accumulates across runs —
+mullion supplies the learning; persistence is the app's choice.
+
+```text
+cargo run --example teach
+```
+
 **`examples/spiral_stress.rs`** (in the `aerie` crate) — an animated stress test
 and visual demo.  Draws a stack of nested frames arranged like a Fibonacci /
 golden-rectangle spiral that continuously uncurls and re-curls the other way
@@ -1748,7 +1763,8 @@ weights to a user's drag-corrections (preference learning) — a layout engine y
 train by showing it improvements, with no neural net. A greedy refiner and a
 simulated-`anneal`er (richer moves, escapes minima) optimise the score, which now
 scores crossings, length, area, alignment, bends, and edge-over-node. Possible next:
-more terms (symmetry), and capturing drag-corrections in a demo to close the loop.
+more terms (symmetry). The loop is closed end-to-end: `examples/teach.rs` captures
+real drag-corrections and re-fits the weights live.
 
 See `docs/tiling-engine-roadmap.md` and `docs/mullion-design-note.md` for the full
 plans and open design questions. This manual tracks the public API as each phase
