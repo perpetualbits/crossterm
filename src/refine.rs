@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 
+use crate::float::FloatRect;
 use crate::graph::GraphCanvas;
 use crate::layout::TileId;
 
@@ -191,6 +192,128 @@ pub fn refine(
         }
     }
     (before, current)
+}
+
+// ── Simulated annealing (escape local minima) ──────────────────────────────────
+
+/// Tunables for [`anneal`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnnealParams {
+    /// PRNG seed — the same seed gives the same result (annealing is deterministic).
+    pub seed: u64,
+    /// Number of proposed moves.
+    pub iters: usize,
+    /// Starting temperature — accepts bigger uphill moves early.
+    pub start_temp: f32,
+    /// Final temperature — effectively greedy by the end.
+    pub end_temp: f32,
+    /// Grid step for nudge moves, in cells.
+    pub nudge: u16,
+}
+
+impl Default for AnnealParams {
+    fn default() -> Self {
+        Self { seed: 1, iters: 3000, start_temp: 24.0, end_temp: 0.4, nudge: 4 }
+    }
+}
+
+/// Polish `canvas` by **simulated annealing** on the [`score`]: it proposes random
+/// swaps and nudges, always accepts an improvement, and *sometimes* accepts a small
+/// worsening — with probability that falls as the temperature cools — so it escapes
+/// the local minima that greedy [`refine`] gets stuck in.
+///
+/// The best layout seen is kept, so the score **never ends worse than it started**;
+/// returns `(before, after)`. Deterministic for a given `params.seed`.
+pub fn anneal(
+    canvas: &mut GraphCanvas,
+    edges: &[(TileId, TileId)],
+    weights: ScoreWeights,
+    params: AnnealParams,
+) -> (f32, f32) {
+    let before = score(canvas, edges, weights).total;
+    let ids: Vec<TileId> = canvas.nodes().iter().map(|n| n.id).collect();
+    if ids.len() < 2 {
+        return (before, before);
+    }
+    let mut rng = params.seed | 1; // xorshift needs nonzero state
+    let mut current = before;
+    let mut best = before;
+    let mut best_pos = positions(canvas);
+
+    for i in 0..params.iters {
+        // Geometric cooling from start_temp to end_temp.
+        let frac = i as f32 / params.iters.max(1) as f32;
+        let temp = (params.start_temp * (params.end_temp / params.start_temp).powf(frac)).max(1e-3);
+        let undo = propose(canvas, &ids, &mut rng, params.nudge);
+        let delta = score(canvas, edges, weights).total - current;
+        // Metropolis: accept downhill always, uphill with prob exp(-Δ/T).
+        if delta <= 0.0 || rand01(&mut rng) < (-delta / temp).exp() {
+            current += delta;
+            if current < best {
+                best = current;
+                best_pos = positions(canvas);
+            }
+        } else {
+            for (id, r) in undo {
+                canvas.move_to(id, r.x, r.y);
+            }
+        }
+    }
+    for (id, r) in best_pos {
+        canvas.move_to(id, r.x, r.y);
+    }
+    (before, best)
+}
+
+/// Apply a random move — swap two nodes' positions, or nudge one along an axis —
+/// returning the moved nodes' previous rects so it can be undone.
+fn propose(canvas: &mut GraphCanvas, ids: &[TileId], rng: &mut u64, nudge: u16) -> Vec<(TileId, FloatRect)> {
+    if rand01(rng) < 0.5 {
+        let a = ids[(xorshift(rng) as usize) % ids.len()];
+        let mut b = ids[(xorshift(rng) as usize) % ids.len()];
+        if a == b {
+            b = ids[(ids.iter().position(|&x| x == a).unwrap() + 1) % ids.len()];
+        }
+        if let (Some(ra), Some(rb)) = (canvas.place(a), canvas.place(b)) {
+            canvas.move_to(a, rb.x, rb.y);
+            canvas.move_to(b, ra.x, ra.y);
+            return vec![(a, ra), (b, rb)];
+        }
+    } else {
+        let n = ids[(xorshift(rng) as usize) % ids.len()];
+        if let Some(r) = canvas.place(n) {
+            let step = nudge as i32;
+            let (dx, dy) = match xorshift(rng) % 4 {
+                0 => (step, 0),
+                1 => (-step, 0),
+                2 => (0, step),
+                _ => (0, -step),
+            };
+            canvas.move_to(n, (r.x as i32 + dx).max(0) as u16, (r.y as i32 + dy).max(0) as u16);
+            return vec![(n, r)];
+        }
+    }
+    Vec::new()
+}
+
+/// The canvas's node positions, for snapshotting the best layout.
+fn positions(canvas: &GraphCanvas) -> HashMap<TileId, FloatRect> {
+    canvas.nodes().iter().map(|n| (n.id, n.place)).collect()
+}
+
+/// One xorshift64 step.
+fn xorshift(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+/// A uniform `[0, 1)` draw from the PRNG.
+fn rand01(state: &mut u64) -> f32 {
+    (xorshift(state) >> 40) as f32 / (1u64 << 24) as f32
 }
 
 // ── Learning the weights from preferences ──────────────────────────────────────
@@ -368,6 +491,27 @@ mod tests {
         assert_eq!(after, settled);
     }
 
+    // ── Annealing ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn anneal_never_worsens_and_uncrosses() {
+        let (mut c, e) = crossed();
+        let w = ScoreWeights::default();
+        let (before, after) = anneal(&mut c, &e, w, AnnealParams::default());
+        assert!(after <= before + f32::EPSILON, "never worse: {before} → {after}");
+        assert_eq!(score(&c, &e, w).crossings, 0, "the crossing is annealed away");
+    }
+
+    #[test]
+    fn anneal_is_deterministic() {
+        let (mut c1, e) = crossed();
+        let (mut c2, _) = crossed();
+        let (w, p) = (ScoreWeights::default(), AnnealParams::default());
+        anneal(&mut c1, &e, w, p);
+        anneal(&mut c2, &e, w, p);
+        assert_eq!(positions(&c1), positions(&c2), "same seed → same layout");
+    }
+
     // ── Learning the weights ──────────────────────────────────────────────
 
     /// A bare score with the given soft terms (overlap 0, total unset).
@@ -445,6 +589,27 @@ mod tests {
                 .collect();
             let w = ScoreWeights::default();
             let (before, after) = refine(&mut c, &edges, w, 6);
+            prop_assert!(after <= before + f32::EPSILON);
+        }
+
+        /// Annealing never ends worse than it started, for any layout / edges.
+        #[test]
+        fn prop_anneal_never_worsens(
+            pos in prop::collection::vec((0u16..50, 0u16..24), 5),
+            pairs in prop::collection::vec((0usize..5, 0usize..5), 0..8),
+            seed in 1u64..9999,
+        ) {
+            let mut c = GraphCanvas::new(64, 32);
+            for (i, &(x, y)) in pos.iter().enumerate() {
+                c.add(i as TileId + 1, FloatRect::new(x, y, 6, 3));
+            }
+            let edges: Vec<(TileId, TileId)> = pairs
+                .into_iter()
+                .filter(|(a, b)| a != b)
+                .map(|(a, b)| (a as TileId + 1, b as TileId + 1))
+                .collect();
+            let p = AnnealParams { seed, iters: 300, ..Default::default() };
+            let (before, after) = anneal(&mut c, &edges, ScoreWeights::default(), p);
             prop_assert!(after <= before + f32::EPSILON);
         }
     }
