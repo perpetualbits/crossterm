@@ -18,6 +18,9 @@
 //! cells three ways — [`render_braille`](Field::render_braille) (2×4 dithered
 //! sub-pixels), [`render_ramp`](Field::render_ramp) (one brightness glyph per cell),
 //! and [`render_glyphs`](Field::render_glyphs) (structure-aware directional strokes).
+//! Each has an `_xy` variant ([`render_braille_xy`](Field::render_braille_xy), …)
+//! whose colour closure also receives the cell's position, so a single image can
+//! carry a **multi-hue scene** — colour by *where* a cell is, not just how bright.
 
 use crate::buffer::Buffer;
 use crate::geometry::Rect;
@@ -105,12 +108,32 @@ impl Field {
     /// mid-grey cell lights about half its dots in a dispersed pattern — interior
     /// gradients get texture instead of going solid, and the dither breaks up the
     /// hard horizontal/vertical banding of a plain threshold. `style(mean)` colours
-    /// the cell from its mean intensity (return a fixed [`Style`] to ignore it).
+    /// the cell from its mean intensity (return a fixed [`Style`] to ignore it); for
+    /// colour that varies by position too, see
+    /// [`render_braille_xy`](Field::render_braille_xy).
     pub fn render_braille(
         &self,
         buf: &mut Buffer,
         intensity: impl Fn(f32, f32) -> f32,
         style: impl Fn(f32) -> Style,
+    ) {
+        self.render_braille_xy(buf, intensity, move |m, _u, _v| style(m));
+    }
+
+    /// Like [`render_braille`](Field::render_braille), but the colour closure also
+    /// receives the cell's **position**: `style(mean, u, v)`, where `(u, v)` is the
+    /// cell's normalised centre `((col + 0.5)/width, (row + 0.5)/height)` — the same
+    /// `[0, 1]` space `intensity` is sampled in.
+    ///
+    /// Positional colour lets one image carry a multi-hue **scene**: blue sky above,
+    /// orange sand below, brown cliffs straddling the horizon — the hue chosen by
+    /// *where* a cell sits, not only how bright it is. The glyph (dot pattern) still
+    /// comes from `intensity`; only the colour gains position.
+    pub fn render_braille_xy(
+        &self,
+        buf: &mut Buffer,
+        intensity: impl Fn(f32, f32) -> f32,
+        style: impl Fn(f32, f32, f32) -> Style,
     ) {
         // 4×4 Bayer matrix → 16 ordered dither levels, tiled over the sub-pixel grid.
         const BAYER: [[u8; 4]; 4] =
@@ -134,7 +157,8 @@ impl Field {
                     }
                 }
                 let g = char::from_u32(0x2800 + mask as u32).unwrap_or(' ');
-                buf.set_grapheme(x, y, &g.to_string(), style(sum / 8.0));
+                let (cu, cv) = self.cell_centre(col, row);
+                buf.set_grapheme(x, y, &g.to_string(), style(sum / 8.0, cu, cv));
             }
         }
     }
@@ -145,12 +169,27 @@ impl Field {
     /// `intensity(u, v)` is as in [`render_braille`](Field::render_braille); the cell
     /// samples a small grid and picks `ramp[round(mean · (ramp.len()-1))]`. Coarser
     /// than braille but reads as glyphs you can recognise. `ramp` must be non-empty.
+    /// For position-dependent colour, see [`render_ramp_xy`](Field::render_ramp_xy).
     pub fn render_ramp(
         &self,
         buf: &mut Buffer,
         intensity: impl Fn(f32, f32) -> f32,
         ramp: &[char],
         style: impl Fn(f32) -> Style,
+    ) {
+        self.render_ramp_xy(buf, intensity, ramp, move |m, _u, _v| style(m));
+    }
+
+    /// Like [`render_ramp`](Field::render_ramp), but the colour closure also receives
+    /// the cell's **position**: `style(mean, u, v)` with `(u, v)` the cell's
+    /// normalised centre — see [`render_braille_xy`](Field::render_braille_xy) for why
+    /// positional colour matters. The glyph still comes from the mean intensity.
+    pub fn render_ramp_xy(
+        &self,
+        buf: &mut Buffer,
+        intensity: impl Fn(f32, f32) -> f32,
+        ramp: &[char],
+        style: impl Fn(f32, f32, f32) -> Style,
     ) {
         if ramp.is_empty() {
             return;
@@ -170,7 +209,8 @@ impl Field {
                 }
                 let mean = sum / 4.0;
                 let idx = ((mean * (ramp.len() - 1) as f32).round() as usize).min(ramp.len() - 1);
-                buf.set_grapheme(x, y, &ramp[idx].to_string(), style(mean));
+                let (cu, cv) = self.cell_centre(col, row);
+                buf.set_grapheme(x, y, &ramp[idx].to_string(), style(mean, cu, cv));
             }
         }
     }
@@ -185,7 +225,8 @@ impl Field {
     /// — so the result *evokes* the image's contours, not just its brightness. It is
     /// O(1) per cell (a handful of samples, then a direct map — no per-glyph search),
     /// fast enough to redraw the whole field every frame. `style(density)` colours
-    /// the cell.
+    /// the cell; for position-dependent colour, see
+    /// [`render_glyphs_xy`](Field::render_glyphs_xy).
     pub fn render_glyphs(
         &self,
         buf: &mut Buffer,
@@ -193,6 +234,21 @@ impl Field {
         ramp: &[char],
         edge: f32,
         style: impl Fn(f32) -> Style,
+    ) {
+        self.render_glyphs_xy(buf, intensity, ramp, edge, move |d, _u, _v| style(d));
+    }
+
+    /// Like [`render_glyphs`](Field::render_glyphs), but the colour closure also
+    /// receives the cell's **position**: `style(density, u, v)` with `(u, v)` the
+    /// cell's normalised centre — see [`render_braille_xy`](Field::render_braille_xy)
+    /// for why positional colour matters. The glyph still comes from `intensity`.
+    pub fn render_glyphs_xy(
+        &self,
+        buf: &mut Buffer,
+        intensity: impl Fn(f32, f32) -> f32,
+        ramp: &[char],
+        edge: f32,
+        style: impl Fn(f32, f32, f32) -> Style,
     ) {
         if ramp.is_empty() {
             return;
@@ -216,9 +272,16 @@ impl Field {
                     let idx = ((density * (ramp.len() - 1) as f32).round() as usize).min(ramp.len() - 1);
                     ramp[idx]
                 };
-                buf.set_grapheme(x, y, &glyph.to_string(), style(density));
+                let (cu, cv) = self.cell_centre(col, row);
+                buf.set_grapheme(x, y, &glyph.to_string(), style(density, cu, cv));
             }
         }
+    }
+
+    /// The normalised centre `((col + 0.5)/width, (row + 0.5)/height)` of logical cell
+    /// `(col, row)`, in the same `[0, 1]` space the intensity function is sampled in.
+    fn cell_centre(&self, col: u16, row: u16) -> (f32, f32) {
+        ((col as f32 + 0.5) / self.width as f32, (row as f32 + 0.5) / self.height as f32)
     }
 }
 
@@ -340,6 +403,62 @@ mod tests {
         // Flat field → no edge → a ramp glyph for the density.
         term.draw(|buf| f.render_glyphs(buf, |_, _| 0.5, &BLOCK_RAMP, 0.1, |_| Style::default())).unwrap();
         assert!(BLOCK_RAMP.contains(&sym(&term).chars().next().unwrap()));
+    }
+
+    #[test]
+    fn xy_colour_varies_by_position() {
+        use crate::style::Color;
+        // A 4-wide field: cell centres u = 0.125, 0.375, 0.625, 0.875 → left two are
+        // u < 0.5, right two u ≥ 0.5.
+        let f = Field::rect(Rect::new(0, 0, 4, 2));
+        let white = |_: f32, _: f32| 1.0;
+        let split = |_value: f32, u: f32, _v: f32| {
+            Style::default().fg(if u < 0.5 { Color::Red } else { Color::Blue })
+        };
+        let mut term = Terminal::new(TestBackend::new(4, 2)).unwrap();
+        let fg = |t: &Terminal<TestBackend>, x, y| t.backend().buffer().get(x, y).style.fg;
+
+        // The (u, v) reaches every encoder's colour closure and splits left/right.
+        for label in ["braille", "ramp", "glyphs"] {
+            match label {
+                "braille" => term.draw(|buf| f.render_braille_xy(buf, white, split)).unwrap(),
+                "ramp" => term.draw(|buf| f.render_ramp_xy(buf, white, &BLOCK_RAMP, split)).unwrap(),
+                _ => term.draw(|buf| f.render_glyphs_xy(buf, white, &BLOCK_RAMP, 0.2, split)).unwrap(),
+            }
+            for y in 0..2 {
+                assert_eq!(fg(&term, 0, y), Color::Red, "{label} col 0");
+                assert_eq!(fg(&term, 1, y), Color::Red, "{label} col 1");
+                assert_eq!(fg(&term, 2, y), Color::Blue, "{label} col 2");
+                assert_eq!(fg(&term, 3, y), Color::Blue, "{label} col 3");
+            }
+        }
+    }
+
+    #[test]
+    fn base_methods_match_their_xy_variant() {
+        use crate::style::Color;
+        // A gradient image so cells differ; the base method must produce exactly the
+        // same buffer as its `_xy` variant with a position-ignoring colour closure.
+        let f = Field::rect(Rect::new(0, 0, 5, 3));
+        let img = |u: f32, _v: f32| u;
+        let col = |m: f32| Style::default().fg(Color::Rgb((m * 255.0) as u8, 0, 0));
+        let mut a = Terminal::new(TestBackend::new(5, 3)).unwrap();
+        let mut b = Terminal::new(TestBackend::new(5, 3)).unwrap();
+        let same = |a: &Terminal<TestBackend>, b: &Terminal<TestBackend>| {
+            (0..5).all(|x| (0..3).all(|y| a.backend().buffer().get(x, y) == b.backend().buffer().get(x, y)))
+        };
+
+        a.draw(|buf| f.render_braille(buf, img, col)).unwrap();
+        b.draw(|buf| f.render_braille_xy(buf, img, |m, _, _| col(m))).unwrap();
+        assert!(same(&a, &b), "render_braille unchanged");
+
+        a.draw(|buf| f.render_ramp(buf, img, &BLOCK_RAMP, col)).unwrap();
+        b.draw(|buf| f.render_ramp_xy(buf, img, &BLOCK_RAMP, |m, _, _| col(m))).unwrap();
+        assert!(same(&a, &b), "render_ramp unchanged");
+
+        a.draw(|buf| f.render_glyphs(buf, img, &BLOCK_RAMP, 0.1, col)).unwrap();
+        b.draw(|buf| f.render_glyphs_xy(buf, img, &BLOCK_RAMP, 0.1, |m, _, _| col(m))).unwrap();
+        assert!(same(&a, &b), "render_glyphs unchanged");
     }
 
     #[test]
