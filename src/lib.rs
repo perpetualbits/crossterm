@@ -93,7 +93,7 @@ pub use float::{
 };
 pub use graph::{GraphCanvas, Viewport};
 pub use record::{RecordSource, VecRecordSource, Window};
-pub use refine::{learn_weights, refine, score, LayoutScore, Preference, ScoreWeights};
+pub use refine::{anneal, learn_weights, refine, score, AnnealParams, LayoutScore, Preference, ScoreWeights};
 pub use route::{render as render_connectors, route, route_all, Connector, RouteRequest};
 pub use runaround::{flow, render_flow, slots_in, PlacedLine, Slot};
 pub use socket::{bookends, draw_socket, Flow, FlowStyle, Socket};
