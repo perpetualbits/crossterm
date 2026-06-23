@@ -61,6 +61,7 @@ pub mod label;
 pub mod layout;
 pub mod mouse;
 pub mod record;
+pub mod refine;
 pub mod render;
 pub mod route;
 pub mod runaround;
@@ -92,6 +93,7 @@ pub use float::{
 };
 pub use graph::{GraphCanvas, Viewport};
 pub use record::{RecordSource, VecRecordSource, Window};
+pub use refine::{refine, score, LayoutScore, ScoreWeights};
 pub use route::{render as render_connectors, route, route_all, Connector, RouteRequest};
 pub use runaround::{flow, render_flow, slots_in, PlacedLine, Slot};
 pub use socket::{bookends, draw_socket, Flow, FlowStyle, Socket};
