@@ -1172,6 +1172,36 @@ automata and wave colour fields, and strips for corner-crossing gaps and
 content-carrying wires). Demo: `cargo run --example video` (`space` cycles the
 encoders, `c` toggles the value→hue colour layer).
 
+### 3.27 Layout quality & refinement — `mullion::refine`
+
+A layout's quality is a **weighted sum of measurable aesthetic criteria** — the
+classic graph-drawing metrics — and `score` computes it over a `GraphCanvas` (lower
+is better). `refine` then **hill-climbs** it: it swaps node positions and keeps a
+swap only when it lowers the score, so the score never increases. Run it after
+`auto_layout` (§3.25) to polish, or on any hand-placed graph.
+
+```rust
+use mullion::refine::{score, refine, ScoreWeights};
+
+let w = ScoreWeights::default();          // tunable knobs: crossings, length, area, …
+let before = score(&canvas, &edges, w);   // raw terms + a weighted total
+let (b, a) = refine(&mut canvas, &edges, w, /* max passes */ 30);
+// e.g. a Sugiyama layout 47 → 22: the cycle's crossing gone, wires 25% shorter.
+```
+
+`score` returns a `LayoutScore` with both the weighted `total` and the **raw terms**
+(crossings, length, area, alignment, overlap) — so a caller can see *why* one layout
+beats another. The terms reuse what the engine already measures (crossings cf.
+`sugiyama::crossings`; length is the connector budget). `refine` converges to a
+swap-stable local optimum and is idempotent there.
+
+The score is deliberately **explicit and tunable** so it can be *learned*: because
+manual placement (§3.21) and auto-layout (§3.25) share one `GraphCanvas`, a
+drag-improved layout B versus the machine's A is a free preference pair (`B ≻ A`)
+to fit the weights to a user's taste — a learnable layout engine with no neural net,
+on this deterministic scaffolding. Demo: `cargo run --example autolayout` (`a` lays
+out, then `r` refines — watch the crossings and length drop in the status line).
+
 ---
 
 ## 4. API reference by module
@@ -1199,6 +1229,7 @@ encoders, `c` toggles the value→hue colour layer).
 | `route` | `route` (grid A\* with bend penalty), `route_all` (nudged set), `RouteRequest`, `Connector` (`route`), `render` (colour-per-net) |
 | `zoom` | `Lod` (`for_area`/`for_rect`), `LodScale`, `Zoom` (`weight`, `set_progress`), `lerp_rect`, `FocusTarget` (`resolve`) |
 | `sugiyama` | `auto_layout`, `assign_layers`, `order_layers`, `crossings`, `SugiyamaParams`, `LayerDir` |
+| `refine` | `score`, `refine`, `LayoutScore`, `ScoreWeights` |
 | `text` | `wrap`, `wrap_into_slots`, `shape_line`, `render_wrapped`, `render_line`, `WrappedText` (`lines`, `visible`, `page`, `page_count`), `VisualLine`, `VisualCell`, `CursorMap` (`visual_to_logical`, `logical_to_visual`), `BaseDirection` |
 | `record` | `RecordSource` (`key_of`, `fetch_after`, `fetch_before`, `approx_position`, `exact_len`), `Window`, `VecRecordSource` (`new`, `estimated`) |
 | `vlist` | `VirtualList` (`visible`, `scroll_by`, `set_viewport`, `scroll_metrics`, `at_top`/`at_bottom`, `capacity`), `ScrollMetrics`, `render_scrollbar` (vertical or horizontal by rect shape) |
@@ -1230,7 +1261,7 @@ Common re-exports at the crate root: `Buffer`, `Cell`, `Node`, `Constraint`,
 `route_all`, `Connector`, `RouteRequest`, `render_connectors`, `Viewport`, `Lod`,
 `LodScale`, `Zoom`, `lerp_rect`, `FocusTarget`, `auto_layout`, `assign_layers`,
 `order_layers`, `crossings`, `SugiyamaParams`, `LayerDir`, `Field`, `BLOCK_RAMP`,
-`ASCII_RAMP`.
+`ASCII_RAMP`, `score`, `refine`, `LayoutScore`, `ScoreWeights`.
 Module-scoped:
 `Axis`, `region_of`, `carousel_visible_range`, `solve` (`layout`);
 `Dir`/`Direction` (`tree`).
@@ -1574,9 +1605,10 @@ ported → full internal graph). `Tab` focuses, `space`/`z` zoom in/out.
 cargo run --example zoom
 ```
 
-**`examples/autolayout.rs`** — the §3.25 Sugiyama auto-layout: a directed graph
-(with one cycle) that you scatter (`s`) and then lay out (`a`) into clean
-left-to-right layers, gliding into place; the result lives on a pannable canvas.
+**`examples/autolayout.rs`** — the §3.25 Sugiyama auto-layout and §3.27 refinement:
+a directed graph (with one cycle) that you scatter (`s`), lay out (`a`) into clean
+left-to-right layers, then **refine** (`r`) to polish — nodes glide into place and
+the status line shows crossings, score, and wire length dropping. Pannable canvas.
 
 ```text
 cargo run --example autolayout
@@ -1660,6 +1692,11 @@ design — not in v1.
 **Field** direction — one surface for video (the braille / ramp / glyph encoders),
 and the substrate for corner-crossing gaps and content-carrying wires (strips), and
 cellular-automata / wave colour sources. Not part of the 13-phase plan.
+
+`mullion::refine` (§3.27) begins a **learnable-layout** direction: an explicit,
+weighted quality `score` plus a local-search `refine` over it — the deterministic
+scaffolding for fitting the weights to a user's drag-corrections later (a learnable
+layout engine with no neural net).
 
 See `docs/tiling-engine-roadmap.md` and `docs/mullion-design-note.md` for the full
 plans and open design questions. This manual tracks the public API as each phase
