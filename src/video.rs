@@ -99,6 +99,13 @@ pub enum Encoding {
     Braille,
     /// `▀` with the upper pixel as fg and the lower as bg — full colour, 1×2 per cell.
     HalfBlock,
+    /// Braille sub-pixels over a **chroma-carrying background** — a luma/chroma split.
+    /// The eye resolves detail in luminance, not colour, so the dots are brightened
+    /// toward white (the high-acuity luminance channel) while the cell *background*
+    /// fills with the hue — dark areas then carry colour instead of black. Brighter
+    /// and more detailed than [`Braille`](Encoding::Braille), at the cost of a per-cell
+    /// background colour (≈2× the output bytes, like [`HalfBlock`](Encoding::HalfBlock)).
+    LumaChroma,
 }
 
 /// How [`Encoding::Braille`] decides which sub-pixels light — the dither.
@@ -234,7 +241,7 @@ impl Video {
         }
         let compiled = self.compile_filters();
         match self.encoding {
-            Encoding::Braille => {
+            Encoding::Braille | Encoding::LumaChroma => {
                 let (gw, gh) = (area.width as usize * 2, area.height as usize * 4);
                 let s = FrameSampler::new(frame, gw, gh, self.sampling);
                 self.render_braille(buf, area, gw, gh, &compiled, |gx, gy| s.at(gx, gy));
@@ -255,7 +262,7 @@ impl Video {
         }
         let compiled = self.compile_filters();
         match self.encoding {
-            Encoding::Braille => {
+            Encoding::Braille | Encoding::LumaChroma => {
                 let (gw, gh) = (area.width as usize * 2, area.height as usize * 4);
                 let (sw, sh) = (gw as f32, gh as f32);
                 self.render_braille(buf, area, gw, gh, &compiled, |gx, gy| {
@@ -335,8 +342,19 @@ impl Video {
                 }
                 let g = char::from_u32(0x2800 + mask as u32).unwrap_or(' ');
                 let (r, gn, b) = cell_rgb[row * aw + col];
-                let fg = Color::Rgb((r / 8) as u8, (gn / 8) as u8, (b / 8) as u8);
-                buf.set_char(area.x + col as u16, area.y + row as u16, g, Style::default().fg(fg));
+                let avg = ((r / 8) as u8, (gn / 8) as u8, (b / 8) as u8);
+                let style = if matches!(self.encoding, Encoding::LumaChroma) {
+                    // Luma/chroma split: brighten the dots toward white (more where the
+                    // cell is brighter, so shadows keep their hue and don't speckle) and
+                    // fill the background with a dimmed version of the hue.
+                    let y = luma(avg) / 255.0;
+                    let fg = lerp_rgb(avg, (255, 255, 255), 0.4 * y);
+                    let bg = scale(avg, 0.6);
+                    Style::default().fg(Color::Rgb(fg.0, fg.1, fg.2)).bg(Color::Rgb(bg.0, bg.1, bg.2))
+                } else {
+                    Style::default().fg(Color::Rgb(avg.0, avg.1, avg.2))
+                };
+                buf.set_char(area.x + col as u16, area.y + row as u16, g, style);
             }
         }
     }
@@ -624,6 +642,24 @@ mod tests {
         }
         assert_eq!(buf.get(0, 0).style.fg, Color::Rgb(255, 0, 0));
         assert_eq!(buf.get(3, 0).style.fg, Color::Rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn luma_chroma_fills_the_background_with_hue() {
+        // Braille leaves the cell background default (gaps show through to terminal bg);
+        // LumaChroma fills it with a dimmed version of the cell's hue.
+        let frame = Frame::from_rgb(1, 1, vec![(40, 160, 60)]); // green
+        let area = Rect::new(0, 0, 2, 2);
+        let mut braille = Buffer::empty(area);
+        Video::new().render_frame(&mut braille, area, &frame);
+        let mut lc = Buffer::empty(area);
+        Video::new().encoding(Encoding::LumaChroma).render_frame(&mut lc, area, &frame);
+
+        assert_eq!(braille.get(0, 0).style.bg, Style::default().bg, "braille leaves bg default");
+        match lc.get(0, 0).style.bg {
+            Color::Rgb(r, g, b) => assert!(g > r && g > b, "LumaChroma bg carries the green hue: {r},{g},{b}"),
+            other => panic!("LumaChroma bg should be an Rgb fill, got {other:?}"),
+        }
     }
 
     #[test]
