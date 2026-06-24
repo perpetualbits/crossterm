@@ -83,6 +83,10 @@ name = "colorfield"
 path = "examples/colorfield.rs"
 
 [[example]]
+name = "tv"
+path = "examples/tv.rs"
+
+[[example]]
 name = "teach"
 path = "examples/teach.rs"
 
