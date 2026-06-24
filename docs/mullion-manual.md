@@ -1324,6 +1324,11 @@ against colour resolution:
   colour: most spatial detail, one colour per cell.
 - **`HalfBlock`** — `▀` with the upper source pixel as foreground and the lower as
   background: full colour at 1×2 pixels per cell.
+- **`LumaChroma`** — braille sub-pixels over a chroma-carrying background: a luma/chroma
+  split. The eye resolves detail in luminance, so the dots brighten toward white (the
+  high-acuity channel) while the cell background fills with the hue — dark areas carry
+  colour instead of black. Brighter and more detailed than `Braille`, at ≈2× the output
+  bytes (it sets a background per cell).
 
 For braille, a **`Dither`** chooses how sub-pixels are quantised: `Bayer` (ordered —
 cheap and **temporally stable**, but a regular cross-hatch in flat areas) or
@@ -1367,7 +1372,7 @@ never decodes video itself).
 | `ease` | `smoothstep`, `lerp`, `gaussian` |
 | `field` | `Field` (`rect`, `strip`, `perimeter`, `paint`, `render_braille`/`_xy`, `render_ramp`/`_xy`, `render_glyphs`/`_xy`), `BLOCK_RAMP`, `ASCII_RAMP` |
 | `colorfield` | `Flame` (`new`, `seeded`, `step`, `at`), `Reaction` (`new`, `seeded`, `step`, `at`, `SPOTS`/`MITOSIS`/`MAZE`/`CORAL`), `Wave` (`plasma`, `flag`, `value`), `Palette` (`Fire`/`Ice`/`Rainbow`, `color`) |
-| `video` | `Video` (`new`, `encoding`, `dither`, `sampling`, `filter`, `render_frame`, `render`), `Frame` (`from_rgb`, `from_luma`, `sample`), `Encoding` (`Braille`/`HalfBlock`), `Dither` (`Bayer`/`FloydSteinberg`), `Sampling` (`Bilinear`/`Nearest`), `Filter` (`Scanlines`/`Vignette`/`Phosphor`/`Gamma`/`Saturation`/`Grayscale`), `Rgb` |
+| `video` | `Video` (`new`, `encoding`, `dither`, `sampling`, `filter`, `render_frame`, `render`), `Frame` (`from_rgb`, `from_luma`, `sample`), `Encoding` (`Braille`/`HalfBlock`/`LumaChroma`), `Dither` (`Bayer`/`FloydSteinberg`), `Sampling` (`Bilinear`/`Nearest`), `Filter` (`Scanlines`/`Vignette`/`Phosphor`/`Gamma`/`Saturation`/`Grayscale`), `Rgb` |
 | `theme` | `Theme` (`default`, `light`, `border_style`) |
 | `capabilities` | `Capabilities` (`detect`, `full`, `from_env`) |
 | `charset` | `box_to_ascii` |
@@ -1842,8 +1847,9 @@ cargo run --example colorfield
 
 **`examples/tv.rs`** — the §3.28 `Video` widget: a synthesised colour-bar signal (or
 **real footage** via `cargo run --example tv -- clip.mp4`, decoded by `ffmpeg`),
-reproduced faithfully in truecolour, with `e` to switch braille/half-block encoding,
-`d` to switch Bayer/Floyd–Steinberg dither, `n` to switch bilinear/nearest sampling,
+reproduced faithfully in truecolour, with `e` to cycle braille/half-block/luma-chroma
+encoding, `d` to switch Bayer/Floyd–Steinberg dither, `n` to switch bilinear/nearest
+sampling,
 `c` to drop colour depth (truecolor → 256 → 16 — fewer output bytes on a huge,
 I/O-bound screen), and `1`–`6` to toggle the CRT/grading filters.
 
