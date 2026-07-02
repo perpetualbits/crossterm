@@ -768,6 +768,119 @@ pub fn render_wrapped(buf: &mut Buffer, area: Rect, text: &WrappedText, scroll_t
     visible.len()
 }
 
+// ── Bidi caret motion (§3.2) ───────────────────────────────────────────────
+
+/// The logical caret boundaries of `text` and the **visual column** each occupies.
+///
+/// Returns `(boundaries, cols)` where `boundaries[l]` is the byte offset of the
+/// `l`-th grapheme boundary (`boundaries[n] == text.len()`) and `cols[l]` is the
+/// visual column of a caret sitting at that boundary. A caret before an LTR
+/// grapheme homes to its left edge, before an RTL grapheme to its right edge; the
+/// end boundary homes to the trailing edge of the last logical grapheme. This is
+/// the shared basis for [`visual_step`], [`caret_visual_col`] and
+/// [`caret_from_visual_col`].
+fn caret_cols(text: &str, base: BaseDirection) -> (Vec<usize>, Vec<u16>) {
+    let mut boundaries: Vec<usize> = text.grapheme_indices(true).map(|(b, _)| b).collect();
+    let n = boundaries.len();
+    boundaries.push(text.len());
+    if n == 0 {
+        return (boundaries, vec![0]);
+    }
+
+    let line = shape_line(text, 0, base);
+    let mut colstart = Vec::with_capacity(line.cells.len());
+    let mut acc = 0u16;
+    for cell in &line.cells {
+        colstart.push(acc);
+        acc += cell.width as u16;
+    }
+    let colend = |v: usize| colstart.get(v).copied().unwrap_or(0) + line.cells.get(v).map(|c| c.width as u16).unwrap_or(0);
+
+    let info = BidiInfo::new(text, base.to_level());
+    let is_rtl = |byte: usize| info.levels.get(byte).map(|lv| lv.is_rtl()).unwrap_or(false);
+
+    let mut cols = Vec::with_capacity(n + 1);
+    for l in 0..n {
+        let v = line.map.logical_to_visual(l).unwrap_or(l);
+        cols.push(if is_rtl(boundaries[l]) { colend(v) } else { colstart.get(v).copied().unwrap_or(0) });
+    }
+    // End boundary: trailing edge of the last logical grapheme.
+    let vlast = line.map.logical_to_visual(n - 1).unwrap_or(n - 1);
+    cols.push(if is_rtl(boundaries[n - 1]) { colstart.get(vlast).copied().unwrap_or(0) } else { colend(vlast) });
+
+    (boundaries, cols)
+}
+
+/// The largest grapheme boundary at or before `cursor` (defensive flooring).
+fn floor_boundary(boundaries: &[usize], cursor: usize) -> usize {
+    boundaries.iter().rev().find(|&&b| b <= cursor).copied().unwrap_or(0)
+}
+
+/// Move a logical byte-`cursor` one grapheme in **visual** space across a
+/// bidi-shaped line: `Left`/`Right` are physical arrow directions, but the cursor
+/// stays a logical byte index (grapheme-boundary aligned). Returns the new byte
+/// cursor, or `None` at the visual edge — the same "fell off the end" signal
+/// [`line_edit`](crate::edit::line_edit) gives, so a form can move focus.
+///
+/// The caret follows the visual column order from [`caret_cols`]: in a pure-LTR
+/// line this matches logical motion, in a pure-RTL line it is mirrored, and in
+/// mixed text it steps to the visually adjacent boundary. `Up`/`Down` are not
+/// handled here (return `None`).
+pub fn visual_step(text: &str, cursor: usize, dir: crate::tree::Direction, ctx: TextCtx) -> Option<usize> {
+    use crate::tree::Direction;
+    if text.is_empty() {
+        return None;
+    }
+    let (boundaries, cols) = caret_cols(text, ctx.base);
+    let cur = floor_boundary(&boundaries, cursor.min(text.len()));
+    let l = boundaries.iter().position(|&b| b == cur).unwrap_or(0);
+    let cur_col = cols[l];
+
+    let pick = |cmp: &dyn Fn(u16, u16) -> bool, better: &dyn Fn(u16, u16) -> bool| -> Option<usize> {
+        let mut best: Option<(u16, usize)> = None;
+        for (i, &c) in cols.iter().enumerate() {
+            if cmp(c, cur_col) && best.map_or(true, |(bc, _)| better(c, bc)) {
+                best = Some((c, i));
+            }
+        }
+        best.map(|(_, i)| boundaries[i])
+    };
+    match dir {
+        // Move to the nearest boundary in the requested visual direction.
+        Direction::Right => pick(&|c, cur| c > cur, &|c, bc| c < bc),
+        Direction::Left  => pick(&|c, cur| c < cur, &|c, bc| c > bc),
+        Direction::Up | Direction::Down => None,
+    }
+}
+
+/// The visual column of the caret currently at byte `cursor` (0 for empty text).
+pub fn caret_visual_col(text: &str, cursor: usize, ctx: TextCtx) -> u16 {
+    if text.is_empty() {
+        return 0;
+    }
+    let (boundaries, cols) = caret_cols(text, ctx.base);
+    let cur = floor_boundary(&boundaries, cursor.min(text.len()));
+    let l = boundaries.iter().position(|&b| b == cur).unwrap_or(0);
+    cols[l]
+}
+
+/// The byte cursor whose caret sits nearest visual column `col` (for mouse-click /
+/// visual Home/End placement). Ties resolve to the lower logical boundary.
+pub fn caret_from_visual_col(text: &str, col: u16, ctx: TextCtx) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let (boundaries, cols) = caret_cols(text, ctx.base);
+    let mut best = (u16::MAX, 0usize);
+    for (i, &c) in cols.iter().enumerate() {
+        let d = c.abs_diff(col);
+        if d < best.0 {
+            best = (d, i);
+        }
+    }
+    boundaries[best.1]
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -812,6 +925,39 @@ mod tests {
         assert_eq!(shape_digits("7", DigitShaping::ExtendedArabicIndic), "۷");
         // Non-digits pass through untouched.
         assert_eq!(shape_digits("v1.0", DigitShaping::ArabicIndic), "v١.٠");
+    }
+
+    #[test]
+    fn visual_step_ltr_matches_logical_motion() {
+        use crate::tree::Direction::{Left, Right};
+        let ctx = TextCtx::LTR;
+        assert_eq!(visual_step("abc", 0, Right, ctx), Some(1));
+        assert_eq!(visual_step("abc", 1, Right, ctx), Some(2));
+        assert_eq!(visual_step("abc", 3, Right, ctx), None); // right edge
+        assert_eq!(visual_step("abc", 3, Left, ctx), Some(2));
+        assert_eq!(visual_step("abc", 0, Left, ctx), None); // left edge
+        // Wide grapheme: motion steps by whole cluster (byte 1 → 4 over 世).
+        assert_eq!(visual_step("a世b", 1, Right, ctx), Some(4));
+        assert_eq!(caret_visual_col("a世b", 4, ctx), 3); // a=1 + 世=2 columns
+    }
+
+    #[test]
+    fn visual_step_rtl_is_mirrored() {
+        use crate::tree::Direction;
+        // Hebrew, pure RTL: Right moves toward the logical start (visually right).
+        let heb = "אבג"; // 3 graphemes, 2 bytes each → boundaries 0,2,4,6
+        let ctx = TextCtx::rtl();
+        assert_eq!(visual_step(heb, 0, Direction::Right, ctx), None); // logical start = visual right edge
+        assert_eq!(visual_step(heb, 6, Direction::Left, ctx), None);  // logical end = visual left edge
+        assert_eq!(visual_step(heb, 6, Direction::Right, ctx), Some(4));
+        assert_eq!(visual_step(heb, 4, Direction::Right, ctx), Some(2));
+        assert_eq!(visual_step(heb, 0, Direction::Left, ctx), Some(2));
+        // Caret columns descend with logical index under RTL.
+        assert_eq!(caret_visual_col(heb, 0, ctx), 3);
+        assert_eq!(caret_visual_col(heb, 6, ctx), 0);
+        // Click nearest a visual column resolves to the right byte.
+        assert_eq!(caret_from_visual_col(heb, 0, ctx), 6);
+        assert_eq!(caret_from_visual_col(heb, 3, ctx), 0);
     }
 
     #[test]
