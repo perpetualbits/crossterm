@@ -119,6 +119,76 @@ pub fn draw_panel(buf: &mut Buffer, area: Rect, panel: &Panel) -> Rect {
     interior
 }
 
+// ── Key-hint / command bar (round-2 B3) ──────────────────────────────────────
+
+/// Lay out `(key, label)` hint pairs across `rect` as a footer/command bar.
+///
+/// Keys render in [`theme.accent`](crate::Theme::accent), labels in
+/// [`theme.text_dim`](crate::Theme::text_dim), separated by ` · `. Every text run
+/// goes through [`shape_line`](crate::text::shape_line) so a label in any script
+/// renders correctly, and the row is truncated with `…` when it overflows. Under an
+/// RTL `ctx.base` the bar is right-aligned. Draws nothing for a zero-size rect.
+pub fn render_keyhints(
+    buf:   &mut Buffer,
+    rect:  Rect,
+    hints: &[(&str, &str)],
+    theme: &crate::Theme,
+    ctx:   crate::text::TextCtx,
+) {
+    use crate::text::{elide, render_line, shape_line, BaseDirection};
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    // Styled runs in reading order: "key" then " label", ` · ` between hints.
+    let mut segs: Vec<(String, Style)> = Vec::new();
+    for (i, (key, label)) in hints.iter().enumerate() {
+        if i > 0 {
+            segs.push((" · ".to_string(), theme.text_dim));
+        }
+        segs.push(((*key).to_string(), theme.accent));
+        if !label.is_empty() {
+            segs.push((format!(" {label}"), theme.text_dim));
+        }
+    }
+    let width_of = |t: &str| shape_line(t, 0, ctx.base).width();
+    let total: u16 = segs.iter().map(|(t, _)| width_of(t)).sum();
+    let y = rect.y;
+
+    if total <= rect.width {
+        // Fits: LTR flush-left, RTL flush-right (the whole block moves to the trailing gutter).
+        let mut x = if matches!(ctx.base, BaseDirection::Rtl) {
+            rect.x + rect.width - total
+        } else {
+            rect.x
+        };
+        for (t, st) in &segs {
+            let line = shape_line(t, 0, ctx.base);
+            let w = line.width();
+            render_line(buf, x, y, &line, w, *st);
+            x += w;
+        }
+    } else {
+        // Overflow: draw from the left, eliding the run that crosses the edge.
+        let mut x = rect.x;
+        for (t, st) in &segs {
+            let avail = (rect.x + rect.width).saturating_sub(x);
+            if avail == 0 {
+                break;
+            }
+            if width_of(t) <= avail {
+                let line = shape_line(t, 0, ctx.base);
+                let w = line.width();
+                render_line(buf, x, y, &line, avail, *st);
+                x += w;
+            } else {
+                let clipped = elide(t, avail, ctx);
+                render_line(buf, x, y, &clipped, avail, *st);
+                break;
+            }
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -200,5 +270,21 @@ mod tests {
             })
             .unwrap();
         assert!(interior.is_empty(), "1×1 area yields a zero-sized interior");
+    }
+
+    #[test]
+    fn keyhints_render_keys_and_labels_with_separators() {
+        use crate::text::TextCtx;
+        let theme = crate::Theme::default();
+        let mut term = Terminal::new(TestBackend::new(24, 1)).unwrap();
+        term.draw(|buf| {
+            render_keyhints(buf, Rect::new(0, 0, 24, 1), &[("Enter", "save"), ("Esc", "cancel")], &theme, TextCtx::LTR);
+        }).unwrap();
+        let buf = term.backend().buffer();
+        let row: String = (0..24).map(|x| buf.get(x, 0).symbol.chars().next().unwrap_or(' ')).collect();
+        assert!(row.starts_with("Enter save · Esc cancel"), "got {row:?}");
+        // The key glyph carries the accent colour, the label the dim colour.
+        assert_eq!(buf.get(0, 0).style.fg, theme.accent.fg); // 'E' of Enter
+        assert_eq!(buf.get(6, 0).style.fg, theme.text_dim.fg); // 's' of save
     }
 }

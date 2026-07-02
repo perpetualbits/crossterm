@@ -85,7 +85,7 @@ pub use border::{draw_box, frame_tiles, render_rim, render_shared, BorderGap, Bo
 pub use buffer::{Buffer, Cell};
 pub use edit::{line_edit, render_field, FieldRender};
 pub use geometry::{mirror_rects_in, visible_window, Rect};
-pub use panel::{draw_panel, Panel};
+pub use panel::{draw_panel, render_keyhints, Panel};
 pub use input::{InputRouter, Keymap, KeyCode, KeyEvent, KeyModifiers, KeyOutcome, MouseButton, MouseEvent, MouseEventKind, MouseOutcome, NavCommand};
 pub use mouse::{carousel_at, tile_at};
 pub use layout::{carousel_visible_range, region_of, Constraint, Node, Orientation, Size, TileId};
